@@ -9,8 +9,7 @@
 //!   those opcodes together will be one instruction definition. For simplicity I'm
 //!   just going to use the terms "instruction definition" and "instruction" interchangably,
 //!   but when I refer to a query returning a list of "instructions" each "instruction" may
-//!   not technically encode to a single opcode on the machine. If I need to refer to an
-//!   instruction in the sense of something defined in the ISA, I will say "opcode".
+//!   not technically encode to a single opcode on the machine.
 //!
 //! - The biggest difference between this and other similar libraries is that this doesn't
 //!   have any outwards-facing concept of "instructions". Instead, Lightbeam requests an
