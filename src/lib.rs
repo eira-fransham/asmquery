@@ -6,7 +6,7 @@
 //!   _definitions_ in the machine spec. This will mostly line up one-to-one with
 //!   opcodes in the ISA but there will probably be some architectures for which
 //!   multiple opcodes are needed to generate a single output, in which case all
-//!   those instructions together will be one instruction definition. For simplicity I'm
+//!   those opcodes together will be one instruction definition. For simplicity I'm
 //!   just going to use the terms "instruction definition" and "instruction" interchangably,
 //!   but when I refer to a query returning a list of "instructions" each "instruction" may
 //!   not technically encode to a single opcode on the machine. If I need to refer to an
