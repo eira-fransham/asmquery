@@ -19,11 +19,18 @@
 //!   backend can request an add-with-carry, which might look like this (strawman syntax):
 //!   ```
 //!   %2 = add %0, %1
-//!   %3 = carry %2
+//!   %3 = add_carry %0, %1
 //!   ```
-//!   This means that results that we get as a side-effect and results we get because we
-//!   specifically asked for them are not distinguished. I'm pretty sure this will make code
-//!   simpler on the compiler-side, since we can have a single codepath that handles both.
+//!   `add_carry` is _not_ add-with-carry, it simply asks whether the add operation with
+//!   the provided operands would set the carry bit. These two directives will compile to
+//!   a single instruction, since there is an instruction that can generate both (i.e.
+//!   `add`). Results that we get as a side-effect and results we get because we
+//!   specifically asked for them are not distinguished. I'm pretty sure this will make
+//!   code simpler on the compiler-side, since we can have a single codepath that handles
+//!   both. You could imagine add-using-carry-bit (`adc` on x86) being represented as a
+//!   3-argument add, where the third argument must be in the carry bit of the flags
+//!   register. Lightbeam could handle 3-argument add with either `lea`, `adc` or two
+//!   `add`s depending on where inputs are.
 //!
 //!   For an example of how this may simplify things, it means that the compiler can
 //!   write code generically handling the case that we already have an is-zero
@@ -135,26 +142,19 @@
 //! with better tracking of clobbering in the generic backend - such as `add, mov, test`
 //! being converted into `add, mov` with the test implicit in the `add` but not clobbered by
 //! the `mov` - but it's great that we get some optimisations implemented for free. This
-//! algorithm also implicitly causes patterns like the following to error out:
+//! algorithm will also allow the following:
 //!
 //! ```
 //! %2 = add %0, %1
 //! %3 = sub %1, %2
-//! %4 = carry %2
+//! %4 = add_carry %0, %1
 //! ```
 //!
-//! Since the `carry` output can't be combined with the `sub` output, a query will be performed
-//! for `carry` alone, but since there is no instruction that has a `carry` output for a
-//! register provided as input (the only instructions with a `carry` output are outputting the
-//! `carry` for _other_ outputs) it will cause no instructions to be found and the compiler will
-//! error out. However, sequences like the following _will_ succeed, since although we overwrite
-//! `zf` with` sub` when we query the assembler for `is_zero` it can still return `test`:
-//!
-//! ```
-//! %2 = add %0, %1
-//! %3 = sub %1, %2
-//! %4 = is_zero %2
-//! ```
+//! Since the `add_carry` output can't be combined with the `sub` output, a query will be performed
+//! for `add_carry` alone, which will generate a new add, discard the actual value and keep only
+//! the carry bit. Obviously we should avoid patterns like this where possible, but it means that
+//! if we have an `add` followed by an `add_carry` but DCE eliminates the `add`, we still generate
+//! correct code.
 //!
 //! The lowest level is the actual machine specification, which allows for both generic
 //! outputs that we should expect every machine to have and the machine-specific outputs
@@ -341,19 +341,31 @@ fn make_x64_specification() -> impl Machine {
                 G::Add32.output(int_reg_64, [1, 2]),
                 input(int_reg_32).eq(0),
                 input(int_reg_32.or(m32).or(imm32)),
-                // Calling `.output` here
                 G::Is0.output(flags.zf, [0]),
                 G::Sign.output(flags.sf, [0]),
-                G::Overflow.output(flags.of, []),
-                G::Carry.output(flags.cf, []),
+                // Unlike `Is0` and `Sign`, which are properties of the output, `overflow` and `carry`
+                // are properties of the add operation itself, so they get names that reflect that
+                // and take the add operands as parameters instead of the output (see the `[1, 2]`
+                // instead of `[0]`).
+                G::AddOverflow.output(flags.of, [1, 2]),
+                G::AddCarry.output(flags.cf, [1, 2]),
                 G::Parity.output(flags.pf, [0]),
             ]
+            // TODO: Should this be defined per-output instead of per-instruction? Since an "output"
+            //       should always act the same given the same inputs, no matter what instruction is
+            //       used to implement it.
             .commutative(1, 2),
             // This is the encoding section. Unlike GCC which can just emit `add %0, %1, %2` and
             // let the assembler take care of checking that %0 and %1 match and handling the
             // difference between reg and mem operands, we have to do that work inline. We could
             // easily write helper functions so that this requires less code per-instruction.
-            |_must_be_same_as_b, _must_be_flags, b, c| match c {
+            //
+            // There are ways to use the type system to ensure that this closure receives arguments
+            // of the right type, so this closure here would have arguments of type `Reg`, `Reg`,
+            // `Mem32` (and receive no arguments for the various flags since they always go to the
+            // same place) but the code to make this work is a little hairy so to keep things simple
+            // I've written code that doesn't.
+            |_must_be_same_as_b, b, c| match c {
                 // Hand-waving away this "encode" module, this should just do
                 // the task of actual assembly. This could even use `dynasm`
                 // internally.
@@ -378,9 +390,63 @@ fn make_x64_specification() -> impl Machine {
                 // internally.
                 Reg(c) => encode::mov32_r_r(b.reg()?, c),
                 // TODO: How to handle the fact that memory operands look different between
-                //       backends? Maybe some output in `outputs::Generic` that converts
-                //       some number of inputs into a memory operand? So you define a
-                //       `G::ToMem` instr?
+                //       backends? One possibility is to make all operations RISC and leave
+                //       combining it back together into a CISC instruction to the query
+                //       selector, like we do with condition codes. This would require some
+                //       extra metadata in the assembler but all the logic would be done in
+                //       Lightbeam. For an example of how the metadata would look, x86's add
+                //       with a memory operand would look like so:
+                //
+                //       ```
+                //       [
+                //          // LHS + load(BASE + (INDEX << SCALE) + DISP)
+                //          G::Add32.output(int_reg_64, [1, 5]),
+                //          // load(BASE + (INDEX << SCALE) + DISP)
+                //          G::Load32.internal([2]),
+                //          // BASE + (INDEX << SCALE) + DISP
+                //          G::Add32.internal([3, 4]),
+                //          // (INDEX << SCALE) + DISP
+                //          G::Add32.internal([4, 6]),
+                //          // INDEX << SCALE
+                //          G::ShiftL32.internal([8, 9]),
+                //          input(int_reg_32).eq(0)       // LHS operand
+                //          input(imm32),                 // DISP
+                //          input(int_reg_32), // BASE
+                //          input(int_reg_32), // INDEX
+                //          input(imm3),                  // SCALE
+                //       ]
+                //       ```
+                //
+                //       Where `.internal(..)` means that although the value can be used within
+                //       the instruction, its value cannot be extracted. Code that wanted to use
+                //       this would then write directives that effectively did the following
+                //       (assume `%base`, `%index` and `%lhs` were defined previously):
+                //
+                //       ```
+                //       %mem0 = add %base, %disp
+                //       %shifted_index = shl %index, 2imm3
+                //       %mem1 = add %mem0, shifted_index
+                //       %loaded = load %mem1
+                //       %added = add %lhs, %loaded
+                //       ```
+                //
+                //       This could make our instruction selection far better in cases where the
+                //       WebAssembly did this shifting and addition followed by a load itself,
+                //       since WebAssembly doesn't have complex addressing modes like x86. We
+                //       could convert explicit pointer arithmetic done in WebAssembly to a single
+                //       instruction using the same code that handles all the rest of the query
+                //       selection. The main problem is that it's complex and verbose, but the
+                //       verbosity can trivially be abstracted away and we can probably temper the
+                //       complexity by simply having internal values be normal outputs but with
+                //       a destination that cannot be fulfilled by any constraint. This should
+                //       make everything "just work", since Lightbeam should implement
+                //       generating fake intermediate values that don't actually have anywhere
+                //       allocated anyway, as it makes our implementations of other operations
+                //       better. For example, another instruction that would benefit from fake
+                //       intermediate values would be `cmp`, which could be represented exactly
+                //       the same as `sub` but with the actual `sub` result being internal, which
+                //       would allow `eq` and `sub`-followed-by-`is_zero` to be compiled
+                //       identically, without Lightbeam trying to generate an intermediate result.
                 Memory(/* TODO */) => encode::mov32_r_m(b.reg()?, /* TODO */),
                 Immediate(/* TODO */) => encode::mov32_r_imm(b.reg()?, /* TODO */),
                 _ => Err("Unexpected value"),
