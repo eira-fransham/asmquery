@@ -27,11 +27,10 @@
 //!
 //!   For an example of how this may simplify things, it means that the compiler can
 //!   write code generically handling the case that we already have an is-zero
-//!   result from doing an add and the case that we need to emit a `test`. Since we
-//!   can return multiple possible instructions for each output query, we can even
+//!   result from doing an add and the case that we need to emit a `test`. We can even
 //!   allow the compiler to request "32-bit add with carry output", "32-bit add and
-//!   I don't need the carry output" and "32-bit add and the carry bit must be
-//!   preserved" without special-casing each as different instructions.
+//!   I don't need the carry output" and "32-bit add that cannot clobber the carry bit"
+//!   without special-casing each as different instructions.
 //!
 //! - This is diverging from GCC, but I use "constraint" to refer to a component of an
 //!   instruction query, where it refers to the query specifying that a specific argument
