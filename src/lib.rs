@@ -101,16 +101,26 @@
 //! > NOTE: Constantly iterating over `M` to refine it will probably kill our linear-time goal -
 //!         I believe that technically it's still O(n) since the number of instructions per
 //!         backend is constant but the number of instructions could be quite high. What we
-//!         really want is to have as much refinement as possible done at compile-time, and
-//!         since some of the constraints (specifically, the outputs and the flow of data) are
-//!         known at compile-time, we could concievably have some of this work done in advance
-//!         so that the refinement has a far smaller set to handle. Quite how this will work
-//!         isn't clear, though. We might have to have some abstraction in the assembler query
-//!         engine where it can handle data flow so long as no supplementary registers need to
-//!         be allocated, or even that it can handle allocating some registers with those
-//!         registers being classed as "clobbers" as far as Lightbeam is concerned. This could
-//!         allow us to move far more work into compile-time, at the expense of complexity in
-//!         the assembler and a blurring of the lines between backend and assembler.
+//!         really want is to have as much refinement as possible done at compile-time, and I
+//!         believe that this is absolutely possible since the entirety of each query should
+//!         be known at compile-time, with the only unknowns being query refinements that
+//!         happen across instruction boundaries - e.g. `i32.add` followed by `i32.eqz` can
+//!         compile to a single instruction with this algorithm, but allowing it prevents us
+//!         from doing all querying at compile-time. Something we can do is convert each
+//!         directive from the machine-specific backend into a query at compile time, perform
+//!         that query at compile-time, create a bitfield from the results and then the only
+//!         work we'd need to do at runtime is mask those bitfields together. We can generate
+//!         the bitfield from just the output specifier and the constraints (so returning all
+//!         possible instructions that generate that output, whether from an input value or from
+//!         another output) and then, at runtime, do the work to reduce this to instructions which
+//!         are still valid based on the data flow. We could do the mask first, then only if that
+//!         mask is nonzero can we iterate through the remaining instructions to see if any of them
+//!         work based on the data flow. This would keep the assembler simple without affecting
+//!         performance and should keep us linear-time, since the maximum number of Microwasm
+//!         instructions to iterate through per Wasm instruction is small and constant, the maximum
+//!         number of directives generated per Microwasm instruction is small and constant, and the
+//!         maximum number of instructions we need to iterate through per directive is small and
+//!         constant.
 //!
 //! A cool thing about this algorithm: assuming that it can be efficiently implemented this
 //! gives us optimisations like converting add-and-test into add-and-use-side-effect-flags
@@ -180,28 +190,12 @@ enum Output<S> {
     Specific(S),
 }
 
-/// A virtual register, used by Lightbeam's generic backend to track the flow of data
-/// separate from the actual registers that are used on the machine.
-struct VReg(usize);
-
-/// A virtual value, which has a unique identifier so that the query engine can correctly
-/// refine a series of queries into a single instruction that correctly preserves data
-/// flow, and a constraint on its location. For most instructions it's not important where
-/// one argument should be, so long as it can be moved there. For others one operand _must_
-/// be in a specific place. As far as I know, the only instructions for which this is
-/// absolutely true are `mov`-family instructions, since it doesn't matter if we only have
-/// register-register add and we need it in a memory location so long as we can move it to
-/// that memory location afterwards.
-struct Value {
-    name: VReg,
-    constraint: Constraint,
-}
-
 // TODO: Handle instructions that don't return a value, like `return` or `ud2`.
 //       Probably this can be handled like other outputs, but where the output is of
 //       the bottom type (i.e. a dummy invalid type).
-// TODO: This doesn't handle clobbers, which
-struct Query<S>(Output<S>, Value, Vec<Value>);
+// TODO: This doesn't give any way to avoid clobbers without iterating through results. Do
+//       we care?
+struct Query<S>(Output<S>, Constraint, Vec<Constraint>);
 
 /// Any structure that represents a list of candidate instructions that can be refined by
 /// applying further queries
@@ -368,6 +362,10 @@ fn make_x64_specification() -> impl Machine {
             },
         )
 }
+
+/// A virtual register, used by Lightbeam's generic backend to track the flow of data
+/// separate from the actual registers that are used on the machine.
+struct VReg(usize);
 
 /// A directive to the backend to generate an output from the given inputs
 struct Directive<S> {
