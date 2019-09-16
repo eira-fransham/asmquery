@@ -446,7 +446,8 @@ fn make_x64_specification() -> impl Machine {
                 //       intermediate values would be `cmp`, which could be represented exactly
                 //       the same as `sub` but with the actual `sub` result being internal, which
                 //       would allow `eq` and `sub`-followed-by-`is_zero` to be compiled
-                //       identically, without Lightbeam trying to generate an intermediate result.
+                //       identically, without Lightbeam trying to generate a register for the
+                //       result of the `sub`.
                 Memory(/* TODO */) => encode::mov32_r_m(b.reg()?, /* TODO */),
                 Immediate(/* TODO */) => encode::mov32_r_imm(b.reg()?, /* TODO */),
                 _ => Err("Unexpected value"),
