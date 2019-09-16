@@ -94,9 +94,9 @@
 //!         internal state to make a query `Q'`
 //!       * Refine `M` to only contain the matches that _also_ match `Q'` (NOTE: see below)
 //!     * Get the best match in `M` (by some definition of "best", perhaps by which
-//!       match requires the least spilling or even by cycle count). Note that this match
-//!       is not necessarily a single instruction
-//!     * Pass this best match to the assembler to encode the output into a byte buffer
+//!       match requires the least spilling or even by cycle count)
+//!     * Pass this best match back to the assembler to encode the machine code into
+//!       a byte buffer
 //!
 //! > NOTE: Constantly iterating over `M` to refine it will probably kill our linear-time goal -
 //!         I believe that technically it's still O(n) since the number of instructions per
