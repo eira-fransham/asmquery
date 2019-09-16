@@ -95,8 +95,9 @@
 //!       * Refine `M` to only contain the matches that _also_ match `Q'` (NOTE: see below)
 //!     * Get the best match in `M` (by some definition of "best", perhaps by which
 //!       match requires the least spilling or even by cycle count)
-//!     * Pass this best match back to the assembler to encode the machine code into
-//!       a byte buffer
+//!     * `B` fills this match in with specific locations, so precisely one memory location,
+//!       register etc., and passes this to the assembler to encode it into machine code and
+//!       write it to a byte buffer
 //!
 //! > NOTE: Constantly iterating over `M` to refine it will probably kill our linear-time goal -
 //!         I believe that technically it's still O(n) since the number of instructions per
@@ -122,15 +123,19 @@
 //!         maximum number of instructions we need to iterate through per directive is small and
 //!         constant.
 //!
+//!         If Rust doesn't yet support what we need to truly do this at compile-time, a cache
+//!         could amortise the cost.
+//!
 //! A cool thing about this algorithm: assuming that it can be efficiently implemented this
 //! gives us optimisations like converting add-and-test into add-and-use-side-effect-flags
 //! while _also_ converting add-without-test into `lea` where appropriate, without explicitly
-//! implementing it or even needing to track what side-effects have been produced but not
-//! clobbered. More optimisations could be implemented with better tracking of flags in the
-//! generic backend - such as `add, mov, test` being converted into `add, mov` with the test
-//! implicit in the `add` and not clobbered by the `mov` - but it's great that we get some
-//! optimisations implemented for free. This algorithm also implicitly prevents patterns like
-//! the following:
+//! implementing this as an optimisation or even needing to do any tracking in Lightbeam of
+//! what outputs have been produced as a side-effect and which outputs have been clobbered -
+//! it's just implicit in the querying algorithm. More optimisations could be implemented
+//! with better tracking of clobbering in the generic backend - such as `add, mov, test`
+//! being converted into `add, mov` with the test implicit in the `add` but not clobbered by
+//! the `mov` - but it's great that we get some optimisations implemented for free. This
+//! algorithm also implicitly causes patterns like the following to error out:
 //!
 //! ```
 //! %2 = add %0, %1
@@ -151,83 +156,94 @@
 //! %4 = is_zero %2
 //! ```
 //!
-//! > TODO: What does the querying API look like? Do we need constraints at all? We definitely
-//!         need some way to specify the flow of data so that patterns like the above work,
-//!         but actually constraining them to actual locations seems like it should be
-//!         unnecessary. Should we have `mov` (such as register-register, or register-immediate)
-//!         be a separate instruction to `store`/`load` (memory-register/register-memory) or is
-//!         it better to have the latter expressed as `mov` with a constraint that one operand
-//!         must be a memory location? For now I've chosen the latter.
+//! The lowest level is the actual machine specification, which allows for both generic
+//! outputs that we should expect every machine to have and the machine-specific outputs
+//! that implement behaviour that is unique to each machine. This allows Lightbeam to
+//! provide default implementations of many Wasm instructions to most backends using the
+//! generic outputs, while still making the Rust compiler complain for any Wasm
+//! instructions that can't be implemented using outputs that are in every machine. At
+//! some point we might find that the concept of a generic instruction for every machine
+//! we support is unhelpful and that we want to have some concept of outputs that are
+//! generic across some subset of machines, but for now it's far simpler to have most
+//! outputs exist for all machines with each machine having some set of unique
+//! instructions for special cases.
 //!
-//! The lowest level is the actual machine specification, which allows for both the
-//! generic outputs that we should expect every machine to have and the machine-specific
-//! outputs that implement behaviour that is unique to each machine. This allows
-//! Lightbeam to provide default implementations of many Wasm instructions to most
-//! backends using the generic outputs, while still making the Rust compiler complain
-//! for any Wasm instructions that can't be implemented using outputs that are in
-//! every machine. At some point we might find that the concept of a generic instruction
-//! for every machine in existence is unhelpful and that we want to drill down and have
-//! some concept of outputs that are generic across some subset of machines, but
-//! for now it's far simpler to have most outputs exist for all machines.
-//!
-//! Everywhere where we use `Vec` we'd ideally use some trickery to do everything on the
-//! stack. I have ideas of precisely how to constrain ourselves to the stack but to keep
-//! this sample code simple I've used `Vec`.
+//! A quick note: everywhere where we use `Vec` we'd ideally use some trickery to do
+//! everything on the stack and avoid allocation. Every allocation means work that
+//! cannot be done at compile-time and increased difficulty figuring out complexity. I
+//! have ideas of precisely how to constrain ourselves to the stack everywhere that we
+//! need to be, but to keep this sample code simple I've used `Vec` for now.
 
 /// An argument constraint, this means that this input or output must be in a specific place.
+// TODO: We might want this to have some way to specify that the output needs to be a special
+//       register - `rip`, `FLAGS` etc. - or a specific section of memory (since x86 has
+//       different instructions depending on how big your memory operand is). The only thing
+//       it shouldn't care about is concerns that span more than one query, such as data flow
 struct Constraint {
     reg: bool,
     mem: bool,
     imm: bool,
 }
 
-/// Any value that can be obtained from another value. This is an "output" and not an
-/// "instruction", as there is a many-to-many relationship between outputs and instructions -
-/// instructions can have many outputs, and a single output could be generated from any
-/// number of different instructions.
+/// Any value that can be obtained from some number of other values. This is an "output" and
+/// not an "instruction", as there is a many-to-many relationship between outputs and
+/// instructions - instructions can have many outputs, and it could be possible to obtain a
+/// given output through one of many different instructions.
 enum Output<S> {
     Generic(outputs::Generic),
     Specific(S),
 }
 
-// TODO: Handle instructions that don't return a value, like `return` or `ud2`.
+// TODO: Handle instructions that don't return a value, like `jmp`, `return`, `ud2` etc.
 //       Probably this can be handled like other outputs, but where the output is of
-//       the bottom type (i.e. a dummy invalid type).
-// TODO: This doesn't give any way to avoid clobbers without iterating through results. Do
-//       we care?
+//       the bottom type (i.e. a dummy invalid type) and so matches all constraints.
+// TODO: This doesn't give any way to avoid clobbers in the query itself, you have to
+//       iterate through results. Does it matter?
 struct Query<S>(Output<S>, Constraint, Vec<Constraint>);
 
-/// Any structure that represents a list of candidate instructions that can be refined by
-/// applying further queries
-trait Matches<S> {
-    fn refine(&mut self, query: Query<S>);
+/// A structure that represents a list of candidate instructions that can be refined by
+/// applying further queries. This should be a bitfield of some kind.
+struct Matches<S> {
+    /* ..TODO.. */
 }
 
+impl<S> Matches<S> {
+    // Get the intersection of two sets of matches
+    fn merge(self, other: Self) -> Self {
+        unimplemented!()
+    }
+
+    // Iterate through the indices of matches
+    // TODO: Should we have `Matches` be able to directly return an iterator of instruction
+    //       definitions instead of requiring Lightbeam to index into the machine manually?
+    fn iter(&self) -> impl Iterator<Item = usize> {
+        unimplemented!()
+    }
+}
+
+/// A machine specification
 trait Machine {
     /// Type of machine-specific outputs
     type SpecificOutput;
-    /// The specific structure implementing the query engine for this machine
-    ///
-    /// > TODO: Do we need this to be a type parameter or can we have this be one type
-    ///         that works on all machines? Almost certainly the latter.
-    type Matches: Matches<Self::SpecificOutput>;
 
     /// Machines should be stateless, so we use `&` here, but it's possible that
     /// we might want to use `&mut` in the future.
-    fn query(&self) -> Self::Matches;
+    // This should just return a bitfield with all bits set.
+    // TODO: This should be a const fn, right now Rust has no way to have
+    //       `const fn`s in traits but there are ways around that.
+    fn query(&self, query: Query<Self::SpecificOutput>) -> Matches<S>;
 }
 
 // I've chosen to write an embedded DSL here, so that we don't have to write
-// blit-a-string-to-a-file-style codegen but we could totally have this be an
+// blit-a-string-to-a-file-style codegen, but we could totally have this be an
 // external DSL like in GCC instead. Writing the codegen would be more of a
-// hassle and make compile-times worse than if we use an eDSL though.
+// hassle and make compile-times worse though, and I think that an eDSL like
+// this would work better for our usecase.
 //
-// This will (or rather, should) compile to code as good as hand-rolled code.
-// We currently use values for most things instead of encoding things into
-// the type system, but using `const fn` should make it so that we can have
-// most of our code compile into the best possible code.
+// If we carefully use `const fn` and the type system, this should compile to
+// code as good as if we had hand-rolled it or written codegen.
 //
-// TODO: How do we handle control flow? The backend should only expose very
+// TODO: How do we handle control flow? The assembler should only expose very
 //       simple functions around this and leave stuff like calling conventions
 //       to Lightbeam, but how do we represent stuff like `je` vs `jle` and
 //       so forth in a way that compiles to efficient code on x86, ARM, etc.
@@ -242,10 +258,14 @@ trait Machine {
 //       `LightbeamBackend` trait that returns the step by which to increment
 //       the amount of space reserved on the stack. The x64 machine spec
 //       could then simply define `push` as an instruction with 2 outputs -
-//       a memory location, where the input is moved, and `rsp`, which is
-//       incremented by 8 respectively. Lightbeam just needs to request the
+//       the memory location at `[rsp]`, where the input is moved, and `rsp`
+//       itself, which is incremented by 8. Lightbeam just needs to request the
 //       value to be moved and the stack pointer to be incremented by 8 and
-//       the query refinement algorithm will take care of the rest.
+//       the query refinement algorithm will take care of the rest. We could
+//       have the same code to write to stack and increment by some amount for
+//       both ARM64 and x64 and have the query refinement algorithm handle
+//       converting this to a `mov` + `sub` on the former and a `push` on the
+//       latter.
 fn make_x64_specification() -> impl Machine {
     use outputs::Generic as G;
 
@@ -311,12 +331,17 @@ fn make_x64_specification() -> impl Machine {
                 //       no other information. It will probably look similar to the `.mask` syntax
                 //       that I have above.
                 //
+                // Calling `.output` on value specifying an output type (for example, `outputs::Generic`)
+                // creates a marker that this instruction can create this output for the given inputs
+                // into some register in the class `int_reg_64`.
+                //
                 // Even though this is a 32-bit add I've used a 64-bit register, since a 32-bit add
                 // will zero the upper bits of the register. Not sure if we could have a better way
                 // of specifying this.
                 G::Add32.output(int_reg_64, [1, 2]),
                 input(int_reg_32).eq(0),
                 input(int_reg_32.or(m32).or(imm32)),
+                // Calling `.output` here
                 G::Is0.output(flags.zf, [0]),
                 G::Sign.output(flags.sf, [0]),
                 G::Overflow.output(flags.of, []),
