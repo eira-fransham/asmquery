@@ -425,7 +425,7 @@ fn make_x64_specification() -> impl Machine {
                 //       ```
                 //       %mem0 = add %base, %disp
                 //       %shifted_index = shl %index, 2imm3
-                //       %mem1 = add %mem0, shifted_index
+                //       %mem1 = add %mem0, %shifted_index
                 //       %loaded = load %mem1
                 //       %added = add %lhs, %loaded
                 //       ```
