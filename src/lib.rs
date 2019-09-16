@@ -411,8 +411,8 @@ fn make_x64_specification() -> impl Machine {
                 //          G::ShiftL32.internal([8, 9]),
                 //          input(int_reg_32).eq(0)       // LHS operand
                 //          input(imm32),                 // DISP
-                //          input(int_reg_32), // BASE
-                //          input(int_reg_32), // INDEX
+                //          input(int_reg_32),            // BASE
+                //          input(int_reg_32),            // INDEX
                 //          input(imm3),                  // SCALE
                 //       ]
                 //       ```
