@@ -494,13 +494,13 @@ fn make_x64_specification() -> impl Machine {
         // if `ECX` is 0.
         .instr(
             [
-                // Even though the internal `And` is commutative, we don't need to generate two versions
-                // of this instruction because both these inputs are fixed.
                 input(int_reg_32),
                 // TODO: Should this be an actual output or should we have a separate category for
                 //       operations that don't produce anything? Or, should we represent this as a
                 //       conditional move into `rip`?
                 G::JumpIf.output(.., [Ref(2), Ref(0)]),
+                // Even though the internal `And` is commutative, we don't need to generate two versions
+                // of this instruction because both these inputs are fixed.
                 G::And(1).output(INTERNAL, [flags.cf, flags.zf]),
             ],
             |a, b| { /* TODO */ },
