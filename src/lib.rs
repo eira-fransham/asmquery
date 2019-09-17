@@ -63,6 +63,7 @@
 //!   running). For the runtime of the code emitted by Lightbeam, I will say words to the
 //!   effect of "when we run Lightbeam's output" or "when running the outputted code".
 //!
+//! -------------------------------------------------------------------------------------
 //!
 //! The highest-level pseudocode looks like this:
 //! * Generate a stateful machine-generic codegen backend `B`, parameterised
@@ -82,7 +83,7 @@
 //!     * `B` passes `Q` into the assembler to get a list of matches `M`
 //!     * `B` checks that there exists some match in `M` that could be emitted (making
 //!       sure that e.g. data flow and clobbers are correct), and if not it returns an
-//!       error.
+//!       error
 //!     * Loop
 //!       * Get the current Low IR instruction `IR'` pointed to by `CD` and advance the
 //!         cursor
@@ -136,21 +137,11 @@
 //!
 //! Since the `add_carry` output can't be combined with the `sub` output, a query will be performed
 //! for `add_carry` alone, which will generate a new add, discard the actual value and keep only
-//! the carry bit. Obviously we should avoid patterns like this where possible, but it means that
-//! if we have an `add` followed by an `add_carry` but DCE eliminates the `add`, we still generate
-//! correct code.
+//! the carry bit. Obviously we should avoid generating patterns like this where possible, but it
+//! means that if we have an `add` followed by an `add_carry` but DCE eliminates the `add`, we
+//! still generate correct code.
 //!
-//! The lowest level is the actual machine specification, which allows for both generic
-//! outputs that we should expect every machine to have and the machine-specific outputs
-//! that implement behaviour that is unique to each machine. This allows Lightbeam to
-//! provide default implementations of many Wasm instructions to most backends using the
-//! generic outputs, while still making the Rust compiler complain for any Wasm
-//! instructions that can't be implemented using outputs that are in every machine. At
-//! some point we might find that the concept of a generic instruction for every machine
-//! we support is unhelpful and that we want to have some concept of outputs that are
-//! generic across some subset of machines, but for now it's far simpler to have most
-//! outputs exist for all machines with each machine having some set of unique
-//! instructions for special cases.
+//! -------------------------------------------------------------------------------------
 //!
 //! A machine's complex memory addressing modes can be implemented by expanding
 //! the complex series of operations done as part of the memory operation into
@@ -185,11 +176,12 @@
 //! instructions that do memory operations are considered as candidates to be
 //! merged together, but that the merged instruction cannot be emitted if LIRC
 //! needs to allocate an actual location for any of these intermediate values,
-//! for example if the intermediate result is used later on. Here's an example of
-//! what some Low IR with complex memory operations would look like. This code
-//! would compile to just a single instruction using the algorithm above and the
-//! instruction definition that I just proposed (assume `%base`, `%index` and
-//! `%lhs` were defined previously):
+//! for example if the calculated address is needed later on. Here's an example of
+//! what some Low IR with complex memory operations would look like. You'd write
+//! Low IR that looks something like the code below and the algorithm above would
+//! collapse all of these into a single instruction on x86 but multiple
+//! instructions on ARM64 (assume `%base`, `%index` and `%lhs` were defined
+//! previously):
 //!
 //! ```
 //! %mem0 = add %base, %disp
@@ -198,6 +190,8 @@
 //! %loaded = load %mem1
 //! %added = add %lhs, %loaded
 //! ```
+//!
+//! We'd probably write some helper method for x86 that abstracted this away.
 //!
 //! The reason that I think that this is a better solution to having some form of
 //! explicit memory calculation is that it's a common pattern in generated Wasm code
@@ -211,16 +205,84 @@
 //! through the whole of the program. This gives us it for free and keeps most of
 //! our code self-contained and stateless.
 //!
+//! A limitation of this is that if you need to use the same address twice, as far
+//! as I can tell it isn't possible to write a single stream of Low IR instructions
+//! that would do the address calculation once and save it to an intermediate
+//! result on ARM but do the calculation twice on x86, since doing the calculation
+//! twice would be slower on ARM but storing to an intermediate register would be
+//! slower on x86. Probably we can just delegate that responsibility to the Low IR
+//! generator.
+//!
+//! -------------------------------------------------------------------------------------
+//!
 //! It might be useful to maintain a bitmask for some subset of outputs that represents
 //! the set of instructions that can actually produce that value into a specific
 //! register or memory location. For example, `add reg, reg` produces an `Add32` output
 //! into location that can be later accessed, whereas after emitting
-//! `mov r2, [r0 + r1]` you cannot access `r0 + r1`. Since we need to check whether we
-//! can emit a given instruction at every step, very quickly masking out all the
-//! instructions that only have an output like `Add32` as an intermediate step would
-//! make code a lot faster, especially since x86 has many, many instructions that can
-//! take memory operands and otherwise we'd need to iterate through every one of them
-//! just to realise that the bounds cannot be fulfilled.
+//! `mov r2, [r0 + r1]` you cannot access `r0 + r1`. We still want to keep the `mov` as
+//! a possible candidate in case the next Low IR operation is a `load` so we can't just
+//! avoid producing it as a match in the first place. If we have some kind of cache
+//! with (probably precalculated) bitmasks based on target locations, we can
+//! pretty easily mask out any instructions that we know for sure are going to be
+//! invalid and only iterate over the remaining ones. This is especially the case for
+//! x86 memory addressing - many, many, many x86 instructions have variants that take a
+//! memory operand, so if we query for an "add" or "shift" we'll get a huge number of
+//! false positives. We could precache "instructions that can put an add result in any
+//! GPR", which will create a bitmask for every instruction is at least one `Add32`
+//! output whose set of possible destinations has any overlap at all with the set of
+//! GPRs.
+//!
+//! -------------------------------------------------------------------------------------
+//!
+//! Clobbers can just be represented as other outputs. A clobber that zeroes some part of
+//! a register becomes a `Zero` operation parameterised with the correct size, likewise a
+//! clobber that leaves some register in an undefined state could be represented as an
+//! `Undefine` operation. The same code that prevents a register from being overwritten by
+//! an intended output can also be used to prevent a register from being overwritten by an
+//! unintended output. This is one of the biggest places that we have bugs right now so
+//! factoring all of the clobber avoidance code into a single place will make codegen far
+//! more robust.
+//!
+//! -------------------------------------------------------------------------------------
+//!
+//! One thing that is useful to note is that virtual registers should map one-to-one with
+//! something that actually exists on the machine. We should never reallocate a register,
+//! if it needs to be moved a new register should be allocated. However, we _should_ be
+//! able to reallocate anything that was pushed onto the Wasm stack. The internal
+//! representation of the stack should be split into a vector of virtual registers and a
+//! mapping from virtual register to real location. We may also want a mapping the other
+//! way around - from real locaton to virtual register and then from virtual register to
+//! positions on the Wasm stack. A mapping that goes the opposite direction means that
+//! we can efficiently free up registers without having to iterate over the entire stack.
+//!
+//! -------------------------------------------------------------------------------------
+//!
+//! How to model control flow is the biggest question-mark here, as it often is. Although
+//! this model works great for straight-line code there are complexities when it comes to
+//! modelling any control flow. It might be useful for the methods on the Low IR
+//! generator that implement control flow instructions to recieve information like the
+//! target calling convention so it can emit `mov`s etc that directly implement this.
+//! Having Low IR implement control flow is desirable - I would ideally want to prevent
+//! LIRC from generating any Low IR itself whatsoever, even delegating the implementation
+//! of `mov`s to the machine-specific generator, but this might not be useful.
+//!
+//! Something that is cross-purposes with control flow: how do we handle conditional
+//! instructions? ARM64 has conditional increment, conditional not, conditional negate,
+//! and conditional move, whereas x86 has conditional move and conditional set. We
+//! definitely want to at least support conditional move, since there is a Wasm
+//! instruction that maps directly to it (`select`).
+//!
+//! The simplest solution is to just have `CMov` be a separate output, one that takes 3
+//! inputs - along with the src and dst we can additionally provide a condition. Ideally,
+//! though, we would somehow combine control flow and conditional instructions, since
+//! that would mean that we could compile code in Wasm that uses control flow to skips
+//! over instructions to use conditional instructions on the target architecture.
+//! Perhaps, when hitting control flow where one branch is directly following the current
+//! one, we can delay generating the actual branch, only doing so if we hit an instruction
+//! that cannot be made conditional. This would end up being pretty hairy though, of
+//! course, since we'd have to avoid clobbering any flags etc that the jump would need.
+//!
+//! -------------------------------------------------------------------------------------
 //!
 //! A quick note: everywhere where we use `Vec` we'd ideally use some trickery to do
 //! everything on the stack and avoid allocation. Every allocation means work that
@@ -243,6 +305,11 @@ struct Constraint {
 /// not an "instruction", as there is a many-to-many relationship between outputs and
 /// instructions - instructions can have many outputs, and it could be possible to obtain a
 /// given output through one of many different instructions.
+///
+/// TODO: We should be able to specify constant folding rules for `Output`s, and just add a
+///       step to the algorithm that greedily folds constants together if both arguments
+///       are constants. This should be far, far less error-prone than the current constant
+///       folding system.
 enum Output<S> {
     Generic(outputs::Generic),
     Specific(S),
@@ -251,15 +318,11 @@ enum Output<S> {
 // TODO: Handle instructions that don't return a value, like `jmp`, `return`, `ud2` etc.
 //       Probably this can be handled like other outputs, but where the output is of
 //       the bottom type (i.e. a dummy invalid type) and so matches all constraints.
-// TODO: This doesn't give any way to avoid clobbers in the query itself, you have to
-//       iterate through results. Does it matter?
 struct Query<S>(Output<S>, Constraint, Vec<Constraint>);
 
 /// A structure that represents a list of candidate instructions that can be refined by
 /// applying further queries. This should be a bitfield of some kind.
-struct Matches<S> {
-    /* ..TODO.. */
-}
+struct Matches<S> {/* ..TODO.. */}
 
 impl<S> Matches<S> {
     // Get the intersection of two sets of matches
@@ -323,35 +386,17 @@ trait Machine {
 fn make_x64_specification() -> impl Machine {
     use outputs::Generic as G;
 
-    fn r32(reg: Reg) -> Reg {
-        use std::u32;
-
-        reg.mask(u32::MAX)
-    }
-
-    fn r16(reg: Reg) -> Reg {
-        use std::u16;
-
-        reg.mask(u16::MAX)
-    }
-
-    fn r8(reg: Reg) -> Reg {
-        use std::u8;
-
-        reg.mask(u8::MAX)
-    }
-
+    // When we define `R0` etc, we should specify its size in bits
     let int_reg_64 = RegClass::new([R0, R1, R2 /* ..snip.. */]);
+    // `r32` should be precisely equal to `.mask(0xFFFF)`
     let int_reg_32 = RegClass::new([r32(R0), r32(R1), r32(R2) /* ..snip.. */]);
     let float_reg_64 = RegClass::new([/* ..snip.. */]);
-    let m64 = Memory.mask(64);
-    let m32 = Memory.mask(32);
-    let imm32 = Immediate.mask(32);
+    let imm32 = Immediate(32);
 
-    // TODO: How to handle some registers overlapping with others? For example,
-    //       some 32-bit instrs clobber the whole 64-bit reg, others only clobber
-    //       part. Maybe we just don't handle this at all? I don't think we need
-    //       to.
+    // TODO: How to handle some registers overlapping with others? For example, some 32-bit
+    //       instrs clobber the whole 64-bit reg, others leave the upper bits untouched.
+    //       Maybe we just don't handle it at all for now, since although it could lead to
+    //       better codegen it's not necessary for correctness AFAIK.
     //
     // This separation of the place that we store, say, the carry flag (i.e. FLAGS & 0x1)
     // with the actual `G::Carry` output that it represents means that we can handle
@@ -370,83 +415,95 @@ fn make_x64_specification() -> impl Machine {
         of: FLAGS.mask(0x800),
     };
 
+    // Since we want the set of outputs to be as minimal as possible, we'd ideally have equality defined
+    // as `is_zero` on the output of a `sub`. However, having to rewrite that and remember that you have
+    // to implement equality that way in every new machine spec is tedious. What we really want is to
+    // have a way to abstract this way. My idea is to have each element of the output array be an
+    // iterator. As far as I know, there's no harm in specifying _both_ an `eq` output and a `sub`-with-
+    // `is_zero` output that just point to the same destination - LIRC should still be able to easily
+    // handle that correctly - but it's error-prone if we have to specify that every single time, when
+    // we know that it will always be true that `a - b == 0` is the same as `a == b`.
     MachineSpec::new()
         .instr(
             // This is the metadata section. This specifies everything that the query engine needs,
             // so inputs, outputs, clobbers, commutativity, maybe even identity.
             [
-                // TODO: We might want more granular specification of inputs than just indices,
-                //       since an instruction might simultaneously use some bits of an input in
-                //       one output and other bits in another output. For example, if we want
-                //       the parity of the full 32-bit add output we will need to use a dedicated
-                //       instruction or series of instructions, but if we only need the parity of
-                //       the LSB then we can reuse the parity result from this `Add32`. Currently I
-                //       don't think this is necessary though, so I've just used indices with
-                //       no other information. It will probably look similar to the `.mask` syntax
-                //       that I have above.
+                // These are the parameters that need to be reused in several outputs. To ensure that
+                // we only generate a single register for them we specify them literally here. You can
+                // only define outputs whose destination and inputs are references to inputs,
+                // references to other outputs or individual registers.
+                input(int_reg_32),
+                input(int_reg_32),
+                G::Add(32).output(Ref(0).mask(0x0000FFFF), [Ref(0), Ref(1)]),
+                // TODO: Is this really necessary? You could imagine it being used to implement constant-
+                //       folding when we do some kind of work with the upper bits of a zeroed register.
                 //
-                // Calling `.output` on value specifying an output type (for example, `outputs::Generic`)
-                // creates a marker that this instruction can create this output for the given inputs
-                // into some register in the class `int_reg_64`.
-                //
-                // Even though this is a 32-bit add I've used a 64-bit register, since a 32-bit add
-                // will zero the upper bits of the register. Not sure if we could have a better way
-                // of specifying this.
-                G::Add32.output(int_reg_64, [1, 2]),
-                input(int_reg_32).eq(0),
-                input(int_reg_32.or(m32).or(imm32)),
-                G::Is0.output(flags.zf, [0]),
-                G::Sign.output(flags.sf, [0]),
-                // Unlike `Is0` and `Sign`, which are properties of the output, `overflow` and `carry`
-                // are properties of the add operation itself, so they get names that reflect that
-                // and take the add operands as parameters instead of the output (see the `[1, 2]`
-                // instead of `[0]`).
-                G::AddOverflow.output(flags.of, [1, 2]),
-                G::AddCarry.output(flags.cf, [1, 2]),
-                G::Parity.output(flags.pf, [0]),
-            ]
-            // TODO: Should this be defined per-output instead of per-instruction? Since an "output"
-            //       should always act the same given the same inputs, no matter what instruction is
-            //       used to implement it.
-            .commutative(1, 2),
-            // This is the encoding section. Unlike GCC which can just emit `add %0, %1, %2` and
-            // let the assembler take care of checking that %0 and %1 match and handling the
-            // difference between reg and mem operands, we have to do that work inline. We could
-            // easily write helper functions so that this requires less code per-instruction.
-            //
-            // There are ways to use the type system to ensure that this closure receives arguments
-            // of the right type, so this closure here would have arguments of type `Reg`, `Reg`,
-            // `Mem32` (and receive no arguments for the various flags since they always go to the
-            // same place) but the code to make this work is a little hairy so to keep things simple
-            // I've written code that doesn't.
-            |_must_be_same_as_b, b, c| match c {
-                // Hand-waving away this "encode" module, this should just do
-                // the task of actual assembly. This could even use `dynasm`
-                // internally.
-                Reg(c) => encode::add32_r_r(b.reg()?, c),
-                // TODO: How to handle the fact that memory operands look different between
-                //       backends? Maybe some output in `outputs::Generic` that converts
-                //       some number of inputs into a memory operand? So you define a
-                //       `G::ToMem` instr?
-                Memory(/* TODO */) => encode::add32_r_m(b.reg()?, /* TODO */),
-                Immediate(/* TODO */) => encode::add32_r_imm(b.reg()?, /* TODO */),
-                _ => Err("Unexpected value"),
-            },
+                //       For now I think we should ignore the mask when trying to work out whether a
+                //       register is clobbered, and only care about it in simple cases like `FLAGS`.
+                G::Zero.output(Ref(0).mask(0xFFFF0000)),
+                G::Is0.output(flags.zf, [Ref(2)]),
+                G::Sign.output(flags.sf, [Ref(2)]),
+                G::Parity.output(flags.pf, [Ref(2)]),
+                // Unlike `Is0`/`Sign`/`Parity`, which are properties of the output, `overflow` and
+                // `carry` are properties of the add operation itself, so they get names that reflect
+                // that and take the add operands as parameters instead of the output (see the `[Ref(0),
+                // Ref(1)]` instead of `[Ref(2)]`). These are outputs that essentially represent whether
+                // this operation _would_ overflow were you to perform it, which is useful because
+                // something like `cmp` can tell you if subtraction will underflow without actually
+                // performing a subtraction. If you've requested a `SubUnderflow32` but not used the
+                // actual result of the `sub`, we can emit a `cmp` instead.
+                G::AddOverflow(32).output(flags.of, [Ref(0), Ref(1)]),
+                G::AddCarry(32).output(flags.cf, [Ref(0), Ref(1)]),
+            ],
+            // This is the encoding section. Although we need to write a different instruction definition
+            // for every form of the instruction (reg-reg, reg-mem, reg-imm, etc) we can trivially write
+            // a helper that has some higher-level form and converts it to multiple instruction
+            // definitions.
+            |args| encode::add32_r_r(args.at(0).reg()?, args.at(1).reg()?),
         )
         .instr(
+            // Since both adds are commutative in this instruction we'd need to generate several versions
+            // of it with the parameters in different orders.
             [
-                G::Mov32.output(m32, [1, 2]),
-                int_reg_32.or(m32).or(imm32).input(),
+                input(int_reg_32), // DEST
+                input(imm32),      // DISP
+                input(int_reg_32), // BASE
+                input(int_reg_32), // INDEX
+                input(imm3),       // SCALE
+                // load(BASE + (INDEX << SCALE) + DISP)
+                G::Load32.output(Ref(0), [Ref(6)]),
+                // BASE + (INDEX << SCALE) + DISP
+                G::Add32.output(INTERNAL, [Ref(2), Ref(7)]),
+                // (INDEX << SCALE) + DISP
+                G::Add32.output(INTERNAL, [Ref(1), Ref(8)]),
+                // INDEX << SCALE
+                G::ShiftL32.output(INTERNAL, [Ref(3), Ref(4)]),
             ],
-            |a, b| match b {
-                // Hand-waving away this "encode" module, this should just do
-                // the task of actual assembly. This could even use `dynasm`
-                // internally.
-                Reg(c) => encode::mov32_r_r(b.reg()?, c),
-                Memory(/* TODO */) => encode::mov32_r_m(b.reg()?, /* TODO */),
-                Immediate(/* TODO */) => encode::mov32_r_imm(b.reg()?, /* TODO */),
-                _ => Err("Unexpected value"),
+            |args| {
+                let dest = args.at(0);
+                let disp = args.at(1);
+                let base = args.at(2);
+                let index = args.at(3);
+                let scale = args.at(4);
+
+                encode::mov32_r_m(dest.reg()?, Mem32(base, index, scale, disp))
             },
+        )
+        // With x86 jumps, there are instructions that do both a logical op and the jump itself.
+        // `ja` is defined to jump if CF = 0 _and_ ZF = 0. It also has an instruction to jump
+        // if `ECX` is 0.
+        .instr(
+            [
+                // Even though the internal `And` is commutative, we don't need to generate two versions
+                // of this instruction because both these inputs are fixed.
+                input(int_reg_32),
+                // TODO: Should this be an actual output or should we have a separate category for
+                //       operations that don't produce anything? Or, should we represent this as a
+                //       conditional move into `rip`?
+                G::JumpIf.output(.., [Ref(2), Ref(0)]),
+                G::And(1).output(INTERNAL, [flags.cf, flags.zf]),
+            ],
+            |a, b| { /* TODO */ },
         )
 }
 
@@ -454,13 +511,20 @@ fn make_x64_specification() -> impl Machine {
 /// separate from the actual registers that are used on the machine.
 struct VReg(usize);
 
-/// A directive to the backend to generate an output from the given inputs
-struct MachineIRInstr<S> {
+/// A single instruction in Low IR. This is a RISC instruction set where each `Output`
+/// specification corresponds to multiple instructions that could theoretically
+/// produce that output. See module documentation for a better description.
+struct LowIRInstr<S> {
     /// The name to give this specific output
     name: VReg,
     /// The output that we want
     output: Output<S>,
     /// The inputs that this output needs
+    // TODO: This should include a "dead value" flag to explicitly mark the final use
+    //       of a value. This makes location reuse explicit (replacing the ad-hoc
+    //       `take`/`release` system in Lightbeam's current backend) and since every
+    //       value has a unique ID we can have debug-mode assertions that ensure that
+    //       we have no double-frees or dangling values.
     inputs: Vec<VReg>,
 }
 
