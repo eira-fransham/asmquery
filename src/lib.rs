@@ -2,75 +2,59 @@
 //! like.
 //!
 //! Here's a quick overview/glossary:
-//! - I'm going to mostly use "instruction" to refer to the concept of instruction
-//!   _definitions_ in the machine spec. This will mostly line up one-to-one with
-//!   opcodes in the ISA but there will probably be some architectures for which
-//!   multiple opcodes are needed to generate a single output, in which case all
-//!   those opcodes together will be one instruction definition. For simplicity I'm
-//!   just going to use the terms "instruction definition" and "instruction" interchangably,
-//!   but when I refer to a query returning a list of "instructions" each "instruction" may
-//!   not technically encode to a single opcode on the machine.
+//! - Unless otherwise specified, I'll use "instruction" to refer to the actual instructions
+//!   on the machine. In the machine spec, multiple instruction definitons could correspond
+//!   to a single opcode, as different sets of arguments are classed as different instruction
+//!   definitions. Although register-register add and register-immediate add are one
+//!   "instruction", they are two separate instruction _definitions_, although almost
+//!   certainly we will have abstractions that allow defining a single operation with all of
+//!   the forms for register-register, register-immediate, register-memory and so on auto-
+//!   generated.
 //!
-//! - The biggest difference between this and other similar libraries is that this doesn't
-//!   have any outwards-facing concept of "instructions". Instead, Lightbeam requests an
-//!   "output" and the assembler produces a (TODO: lazy?) list of possible instructions,
-//!   allowing Lightbeam to request _multiple_ outputs and the assembler will try to
-//!   return one instruction that produces all of them. For example, the machine-specific
-//!   backend can request an add-with-carry, which might look like this (strawman syntax):
+//! - The biggest difference between this and other similar libraries is that the machine
+//!   specification is written in terms of operations, which may have a many-to-many
+//!   correspondance with actual instructions. Operations are the smallest indivisible piece
+//!   of an instruction. An `add` is an operation, but an "`add` and set the carry flag if
+//!   it overflows" is two separate operations, as there exist instructions that can add
+//!   without setting the carry flag.
+//!
+//! - To compile a Wasm operation to assembly, we write a low-level infinite register machine
+//!   IR that I'm going to call Low IR (just so that we have some name to refer to it that
+//!   won't be confused with the actual instructions on the machine). This IR is defined in
+//!   terms of _operations_, which take some number of inputs and produce precisely one
+//!   output. On most machines, many instructions produce multiple outputs when executed. For
+//!   example, the `add` instruction might set the carry flag in the `FLAGS` register. We
+//!   would respresent this as two independent Low IR instructions. With an LLVM IR-style
+//!   strawman syntax, that might look like this:
 //!   ```
 //!   %2 = add %0, %1
 //!   %3 = add_carry %0, %1
 //!   ```
 //!   `add_carry` is _not_ add-with-carry, it simply asks whether the add operation with
-//!   the provided operands would set the carry bit. These two directives will compile to
-//!   a single instruction, since there is an instruction that can generate both (i.e.
-//!   `add`). Results that we get as a side-effect and results we get because we
-//!   specifically asked for them are not distinguished. I'm pretty sure this will make
-//!   code simpler on the compiler-side, since we can have a single codepath that handles
-//!   both. You could imagine add-using-carry-bit (`adc` on x86) being represented as a
-//!   3-argument add, where the third argument must be in the carry bit of the flags
-//!   register. Lightbeam could handle 3-argument add with either `lea`, `adc` or two
-//!   `add`s depending on where inputs are.
+//!   the provided operands would set the carry bit. On x86, one instruction will do both of
+//!   these operations simultaneously, and so we combine them into one. The algorithm that
+//!   does this is provided below.
 //!
-//!   For an example of how this may simplify things, it means that the compiler can
-//!   write code generically handling the case that we already have an is-zero
-//!   result from doing an add and the case that we need to emit a `test`. We can even
-//!   allow the compiler to request "32-bit add with carry output", "32-bit add and
-//!   I don't need the carry output" and "32-bit add that cannot clobber the carry bit"
-//!   without special-casing each as different instructions.
+//! - I'll refer to the machine-specific code that defines the Low IR for each Lightbeam IR
+//!   instruction as the "Low IR generator", since for our purposes here the only important
+//!   thing is that it generates Low IR. The fact that it generates it from Lightbeam IR,
+//!   which in turn is generated from WebAssembly, is not particularly important for our
+//!   purposes here. Since a large number of operations are valid on every machine - every
+//!   machine will have an add, a subtract, a load, a store and so forth - most of this
+//!   code can be provided using a default implementation, with relatively few instructions
+//!   needing machine-specific implementations.
 //!
-//! - This is diverging from GCC, but I use "constraint" to refer to a component of an
-//!   instruction query, where it refers to the query specifying that a specific argument
-//!   should be in a specific place. For the part of the machine specification that
-//!   specifies when a constraint should match I will use "predicate". Instructions _only_
-//!   have predicates, which represent both the kind of location (register, memory, etc)
-//!   and also anything that must further be satisfied, such as an instruction needing
-//!   its input in specific registers.
-//!
-//! - When I say a "directive" I mean an instruction such as the above - a single output
-//!   assigned to a virtual register, with a list of virtual registers as input. Directives
-//!   are a concept that exists only in Lightbeam, as they are tied to the register allocator,
-//!   value stack, etc. The assembler only works in outputs, which may have inputs with
-//!   constraints. Directives are generated by the machine-specific backend and converted
-//!   by the machine-generic backend into queries.
-//!
-//! - When I refer to "the assembler" or "this library" I'm talking about the code that
-//!   converts possibly-machine-specific outputs into definitely-machine-specific bytes
-//!   of machine code. I'll try to consistently use "the assembler" since this page
-//!   contains some code as an example of how Lightbeam might use the assembler and
-//!   saying "this library" might be confusing
-//!
-//! - When I refer to  the "machine-generic backend" I'm referring to the code that calls
-//!   into the assembler. It's the machine-generic backend's responsibility to allocate
-//!   specific registers and track the fact that generating some other outputs (for example,
-//!   another `add`) between that `add` and `carry` may make the information that `carry`
-//!   needs inaccessible, and the machine-specific backend's responsibility to not generate
-//!   a stream of directives that cannot be fulfilled by the assembler.
-//!
-//! - When I refer to the "machine-specific backend", I'll be referring to the code written
-//!   for each target architecture that maps the Microwasm instructions to a stream of
-//!   directives, which will then be used by Lightbeam's machine-generic code to query for
-//!   specific instructions.
+//! - I'm going to refer to the code that compiles Low IR into actual instructions on the
+//!   machine as the Low IR compiler, or LIRC. This code handles allocating real locations
+//!   in registers or on the stack for the virtual registers defined in Low IR, and it
+//!   handles instruction selection. It's possible for a single instruction to be selected
+//!   for many Low IR operations, but impossible for more than one instruction to be
+//!   selected for a single Low IR operation. It should also handle control flow, but
+//!   precisely how this works is currently unclear. Since the machine specification
+//!   provides lots of metadata about the machine, LIRC can be machine-independent,
+//!   relying on the Low IR generator to provide Low IR valid for the machine and the
+//!   machine specification to provide any metadata needed to do correct register
+//!   allocation, instruction selection and control flow.
 //!
 //! - When I refer to "doing work at compile-time", I mean having that work done while
 //!   compiling _Lightbeam_, so that work is already done by the time that Lightbeam
@@ -82,56 +66,56 @@
 //!
 //! The highest-level pseudocode looks like this:
 //! * Generate a stateful machine-generic codegen backend `B`, parameterised
-//!   with a stateless machine-specific directive generator `G`
+//!   with a stateless machine-specific Low IR instruction generator `G`
 //! * Generate a stateless machine-specific assembler `A`
 //! * For each WebAssembly instruction (call each instruction `WI`)
 //!   * Convert `WI` to a stream of Microwasm instructions `MI`
-//!   * Convert `MI` into a stream of directives `DS`
+//!   * Convert `MI` into a stream of Machine IR instructions `IRS`
 //!     * Each individual Microwasm instruction in `MI` is converted into a stream of
-//!       directives by `G` and these streams are concatenated together
-//!   * Create a stateful cursor `CD` into `DS`
-//!   * While `CD` has not reached the end of `DS`
-//!     * Get the current directive `D` pointed to by `CD` and advance the cursor
-//!     * `B` fills in the virtual registers in `D` with constraints based on its
+//!       Low IR instructions by `G` and these streams are concatenated together
+//!   * Create a stateful cursor `CD` into `IRS`
+//!   * While `CD` has not reached the end of `IRS`
+//!     * Get the current Low IR instruction `IR` pointed to by `CD` and advance the
+//!       cursor
+//!     * `B` fills in the virtual registers in `IR` with constraints based on its
 //!       internal state to make a query `Q`
 //!     * `B` passes `Q` into the assembler to get a list of matches `M`
-//!     * While `M` is not empty
-//!       * Get the current directive `D'` pointed to by `CD` and advance the cursor
-//!       * `B` fills in the virtual registers in `D'` with constraints based on its
+//!     * `B` checks that there exists some match in `M` that could be emitted (making
+//!       sure that e.g. data flow and clobbers are correct), and if not it returns an
+//!       error.
+//!     * Loop
+//!       * Get the current Low IR instruction `IR'` pointed to by `CD` and advance the
+//!         cursor
+//!       * `B` fills in the virtual registers in `IR'` with constraints based on its
 //!         internal state to make a query `Q'`
-//!       * Refine `M` to only contain the matches that _also_ match `Q'` (NOTE: see below)
-//!     * Get the best match in `M` (by some definition of "best", perhaps by which
-//!       match requires the least spilling or even by cycle count)
+//!       * Refine `M` to only contain the matches that _also_ match `Q'` to create a new
+//!         list of matches `M'`
+//!       * Exit the loop if `M'` is empty or if there are no matches in `M'` that could be
+//!         emitted (w.r.t. data flow, clobbers etc)
+//!       * Otherwise, set `M` to be `M'` and repeat the loop
+//!     * Get the best match in `M` (by some definition of "best", perhaps by which match
+//!       requires the least spilling or even by cycle count)
 //!     * `B` fills this match in with specific locations, so precisely one memory location,
 //!       register etc., and passes this to the assembler to encode it into machine code and
 //!       write it to a byte buffer
 //!
-//! > NOTE: Constantly iterating over `M` to refine it will probably kill our linear-time goal -
-//!         I believe that technically it's still O(n) since the number of instructions per
-//!         backend is constant but the number of instructions could be quite high. What we
-//!         really want is to have as much refinement as possible done at compile-time, and I
-//!         believe that this is absolutely possible since the entirety of each query should
-//!         be known at compile-time, with the only unknowns being query refinements that
-//!         happen across instruction boundaries - e.g. `i32.add` followed by `i32.eqz` can
-//!         compile to a single instruction with this algorithm, but allowing it prevents us
-//!         from doing all querying at compile-time. Something we can do is convert each
-//!         directive from the machine-specific backend into a query at compile time, perform
-//!         that query at compile-time, create a bitfield from the results and then the only
-//!         work we'd need to do at runtime is mask those bitfields together. We can generate
-//!         the bitfield from just the output specifier and the constraints (so returning all
-//!         possible instructions that generate that output, whether from an input value or from
-//!         another output) and then, at runtime, do the work to reduce this to instructions which
-//!         are still valid based on the data flow. We could do the mask first, then only if that
-//!         mask is nonzero can we iterate through the remaining instructions to see if any of them
-//!         work based on the data flow. This would keep the assembler simple without affecting
-//!         performance and should keep us linear-time, since the maximum number of Microwasm
-//!         instructions to iterate through per Wasm instruction is small and constant, the maximum
-//!         number of directives generated per Microwasm instruction is small and constant, and the
-//!         maximum number of instructions we need to iterate through per directive is small and
-//!         constant.
+//! > NOTE: We can take advantage here of the fact that the list of candidate matches is far
+//! >       larger than the list of matches that we could actually emit. In fact, the candidate
+//! >       matches that we get from the machine specification are deterministically and
+//! >       statelessly generated from each Low IR instruction. This means that we can
+//! >       memoise the query result for each Low IR instruction and store it as a bitfield,
+//! >       where the "refined" matches that are candidate instructions that may be able to
+//! >       produce both outputs can simply be calculated by doing the bitwise `and` of these
+//! >       two bitfields. We then iterate through the remaining matches, doing the calculation
+//! >       that actually needs to be done at runtime - e.g. data flow and clobbers.
 //!
-//!         If Rust doesn't yet support what we need to truly do this at compile-time, a cache
-//!         could amortise the cost.
+//! The most important thing to note here is that Low IR instrs can only be collapsed so long as
+//! there exists some instruction that could collapse each intermediate step. This is because if we
+//! read the next instruction and it can't be collapsed into our current state, we can't rewind to
+//! find the most-recent set of instructions that _can_ be collapsed - we need to emit something and
+//! continue or fail. For example, the complex operations included in x86's memory addressing modes
+//! can be collapsed together since at every step we could always just emit a `lea` to do some
+//! component of an addressing calculation without doing the load.
 //!
 //! A cool thing about this algorithm: assuming that it can be efficiently implemented this
 //! gives us optimisations like converting add-and-test into add-and-use-side-effect-flags
@@ -167,6 +151,76 @@
 //! generic across some subset of machines, but for now it's far simpler to have most
 //! outputs exist for all machines with each machine having some set of unique
 //! instructions for special cases.
+//!
+//! A machine's complex memory addressing modes can be implemented by expanding
+//! the complex series of operations done as part of the memory operation into
+//! a series of RISC inputs and outputs. For example, you could define x86's
+//! 32-bit add with memory operand by specifying exactly how the memory operand
+//! is calculated, splitting it into its component calculations, the load that it
+//! performs, and the resulting addition.
+//!
+//! ```
+//! [
+//!     // LHS + load(BASE + (INDEX << SCALE) + DISP)
+//!     G::Add32.output(int_reg_64, [1, 5]),
+//!     // load(BASE + (INDEX << SCALE) + DISP)
+//!     G::Load32.output(INTERNAL, [2]),
+//!     // BASE + (INDEX << SCALE) + DISP
+//!     G::Add32.output(INTERNAL, [3, 4]),
+//!     // (INDEX << SCALE) + DISP
+//!     G::Add32.output(INTERNAL, [4, 6]),
+//!     // INDEX << SCALE
+//!     G::ShiftL32.output(INTERNAL, [8, 9]),
+//!     input(int_reg_32).eq(0) // LHS operand
+//!     input(imm32),           // DISP
+//!     input(int_reg_32),      // BASE
+//!     input(int_reg_32),      // INDEX
+//!     input(imm3),            // SCALE
+//! ]
+//! ```
+//!
+//! `INTERNAL` is used as the destination of these intermediate outputs. Precisely
+//! how `INTERNAL` is represented isn't important, the important thing is that
+//! whatever constraints it defines cannot be fulfilled. This ensures that
+//! instructions that do memory operations are considered as candidates to be
+//! merged together, but that the merged instruction cannot be emitted if LIRC
+//! needs to allocate an actual location for any of these intermediate values,
+//! for example if the intermediate result is used later on. Here's an example of
+//! what some Low IR with complex memory operations would look like. This code
+//! would compile to just a single instruction using the algorithm above and the
+//! instruction definition that I just proposed (assume `%base`, `%index` and
+//! `%lhs` were defined previously):
+//!
+//! ```
+//! %mem0 = add %base, %disp
+//! %shifted_index = shl %index, 2imm3
+//! %mem1 = add %mem0, %shifted_index
+//! %loaded = load %mem1
+//! %added = add %lhs, %loaded
+//! ```
+//!
+//! The reason that I think that this is a better solution to having some form of
+//! explicit memory calculation is that it's a common pattern in generated Wasm code
+//! to do some simple calculations followed by a memory access. This is because Wasm
+//! only has pretty simple addressing modes. The compiler generating the Wasm code
+//! can generally assume that this pattern can be detected and converted into x86
+//! addressing instructions. If we split our memory addressing up like this, we
+//! can essentially detect and coalesce this pattern for free, whereas if we try to
+//! detect and generate it by inspecting the Wasm instructions and generating some
+//! form of special memory calculation then we have to thread far more information
+//! through the whole of the program. This gives us it for free and keeps most of
+//! our code self-contained and stateless.
+//!
+//! It might be useful to maintain a bitmask for some subset of outputs that represents
+//! the set of instructions that can actually produce that value into a specific
+//! register or memory location. For example, `add reg, reg` produces an `Add32` output
+//! into location that can be later accessed, whereas after emitting
+//! `mov r2, [r0 + r1]` you cannot access `r0 + r1`. Since we need to check whether we
+//! can emit a given instruction at every step, very quickly masking out all the
+//! instructions that only have an output like `Add32` as an intermediate step would
+//! make code a lot faster, especially since x86 has many, many instructions that can
+//! take memory operands and otherwise we'd need to iterate through every one of them
+//! just to realise that the bounds cannot be fulfilled.
 //!
 //! A quick note: everywhere where we use `Vec` we'd ideally use some trickery to do
 //! everything on the stack and avoid allocation. Every allocation means work that
@@ -389,65 +443,6 @@ fn make_x64_specification() -> impl Machine {
                 // the task of actual assembly. This could even use `dynasm`
                 // internally.
                 Reg(c) => encode::mov32_r_r(b.reg()?, c),
-                // TODO: How to handle the fact that memory operands look different between
-                //       backends? One possibility is to make all operations RISC and leave
-                //       combining it back together into a CISC instruction to the query
-                //       selector, like we do with condition codes. This would require some
-                //       extra metadata in the assembler but all the logic would be done in
-                //       Lightbeam. For an example of how the metadata would look, x86's add
-                //       with a memory operand would look like so:
-                //
-                //       ```
-                //       [
-                //          // LHS + load(BASE + (INDEX << SCALE) + DISP)
-                //          G::Add32.output(int_reg_64, [1, 5]),
-                //          // load(BASE + (INDEX << SCALE) + DISP)
-                //          G::Load32.internal([2]),
-                //          // BASE + (INDEX << SCALE) + DISP
-                //          G::Add32.internal([3, 4]),
-                //          // (INDEX << SCALE) + DISP
-                //          G::Add32.internal([4, 6]),
-                //          // INDEX << SCALE
-                //          G::ShiftL32.internal([8, 9]),
-                //          input(int_reg_32).eq(0)       // LHS operand
-                //          input(imm32),                 // DISP
-                //          input(int_reg_32),            // BASE
-                //          input(int_reg_32),            // INDEX
-                //          input(imm3),                  // SCALE
-                //       ]
-                //       ```
-                //
-                //       Where `.internal(..)` means that although the value can be used within
-                //       the instruction, its value cannot be extracted. Code that wanted to use
-                //       this would then write directives that effectively did the following
-                //       (assume `%base`, `%index` and `%lhs` were defined previously):
-                //
-                //       ```
-                //       %mem0 = add %base, %disp
-                //       %shifted_index = shl %index, 2imm3
-                //       %mem1 = add %mem0, %shifted_index
-                //       %loaded = load %mem1
-                //       %added = add %lhs, %loaded
-                //       ```
-                //
-                //       This could make our instruction selection far better in cases where the
-                //       WebAssembly did this shifting and addition followed by a load itself,
-                //       since WebAssembly doesn't have complex addressing modes like x86. We
-                //       could convert explicit pointer arithmetic done in WebAssembly to a single
-                //       instruction using the same code that handles all the rest of the query
-                //       selection. The main problem is that it's complex and verbose, but the
-                //       verbosity can trivially be abstracted away and we can probably temper the
-                //       complexity by simply having internal values be normal outputs but with
-                //       a destination that cannot be fulfilled by any constraint. This should
-                //       make everything "just work", since Lightbeam should implement
-                //       generating fake intermediate values that don't actually have anywhere
-                //       allocated anyway, as it makes our implementations of other operations
-                //       better. For example, another instruction that would benefit from fake
-                //       intermediate values would be `cmp`, which could be represented exactly
-                //       the same as `sub` but with the actual `sub` result being internal, which
-                //       would allow `eq` and `sub`-followed-by-`is_zero` to be compiled
-                //       identically, without Lightbeam trying to generate a register for the
-                //       result of the `sub`.
                 Memory(/* TODO */) => encode::mov32_r_m(b.reg()?, /* TODO */),
                 Immediate(/* TODO */) => encode::mov32_r_imm(b.reg()?, /* TODO */),
                 _ => Err("Unexpected value"),
@@ -460,7 +455,7 @@ fn make_x64_specification() -> impl Machine {
 struct VReg(usize);
 
 /// A directive to the backend to generate an output from the given inputs
-struct Directive<S> {
+struct MachineIRInstr<S> {
     /// The name to give this specific output
     name: VReg,
     /// The output that we want
