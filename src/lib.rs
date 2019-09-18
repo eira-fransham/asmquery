@@ -284,6 +284,122 @@
 //!
 //! -------------------------------------------------------------------------------------
 //!
+//! An idea for how to handle calling conventions and control flow is as follows: we have
+//! a concept of calling conventions in the IR that are defined in terms of virtual
+//! registers. Since virtual registers must be globally unique (i.e. you can't redefine
+//! them even in distinct codepaths) we can have each block simply define the virtual
+//! registers that it needs to be live when you enter it, plus a list of arguments for
+//! locations that can be different every time the block is entered. The Low IR would
+//! then define a calling convention and apply it to some number of blocks:
+//!
+//! ```
+//! .newcc sharedcc (%bar) [%something]
+//!
+//!   %something = const i32 1
+//!   %condition = is_zero %somereg
+//!   %foo = const i32 1
+//! .applycc sharedcc (%foo)
+//!   jmpif %condition, true_branch
+//!   jmp false_branch
+//! label true_branch sharedcc:
+//!   ;; ...
+//! label false_branch sharedcc:
+//!   ;; ...
+//! ```
+//!
+//! The registers in the `[]` are dependencies - registers that must be live when the
+//! block is entered. There are no restrictions on these registers, for example, they can
+//! be constants. Registers in the `()` are arguments - these are passed to the block
+//! every time it is called. Since arguments can be different, when the block is first
+//! called a mutable location is allocated for it - normally a register. This means that
+//! if we pass a constant as an argument we have to spill that constant to a register.
+//!
+//! This maintains the property that every virtual register must correspond to precisely
+//! one location on the machine. For a block that has only one caller, the Low IR
+//! generator can create a calling convention that has no arguments.
+//!
+//! We can also use this system to implement calls, so long as we allow the Low IR to
+//! specify arguments as either physical locations or as virtual registers. You could
+//! imagine that the Low IR might look something like so:
+//!
+//! ```
+//! .newcc systemvi32_i32 (%rsi, %rdi) []
+//! .newcc systemvreti32 (%rax) []
+//!
+//!   %foo = const i32 0
+//!   %bar = const i32 1
+//!   %funcpointer = get_function_pointer_somehow
+//! .applycc systemvi32_i32 (%foo, %bar)
+//!   ;; TODO: Exactly how a call looks isn't clear right now
+//!   jmp some_function
+//! label return_from_call systemvreti32:
+//!   ;; ...
+//! ```
+//!
+//! You can see here that we actually define a new block that would be executed after
+//! `some_function` returns. You can see that the fact that `some_function` returns by
+//! calling `return_from_call` is implicit, based on the fact that `return_from_call` is
+//! directly after the function call. If we wanted to have dead code elimination of any
+//! kind we'd have to model this better. The cleanest way to solve this issue would be by
+//! splitting the `call` instruction into its components, so a call would be calculating
+//! the offset between the `return_from_call` label and the current instruction pointer,
+//! push that to stack, and then branch. However, because we only have one-instruction
+//! lookahead we can't do this. So probably if we ever want to implement DCE at the
+//! level of Low IR we could just have an assembler directive that explicitly marks a
+//! label as used.
+//!
+//! Something we would probably want to do is have a spill instruction that specifies
+//! what is off-limits, and then emit a spill instruction for each variable that we want
+//! to be maintained across the boundary of the function. For example:
+//!
+//! ```
+//! ;; .. snip..
+//! .newcc systemvreti32 (%rax) [%keep_me, %keep_me_too]
+//!
+//!   ;; ..snip..
+//!   %something = const i32 1
+//!   %something_else = ;; some calculation that produces its value in `%rsi`
+//!   %keep_me = spill %something, [%rsi, %rdi, ..]
+//!   %keep_me_too = spill %something_else, [%rsi, %rdi, ..]
+//!   ;; ..snip..
+//! .applycc systemvi32_i32 (%foo, %bar)
+//!   ;; ..snip..
+//! label return_from_call systemvreti32:
+//!   %new_variable = add %keep_me, %keep_me
+//!   ;; ...
+//! ```
+//!
+//! In this case we can see that `%keep_me` would be exactly the same as `%something`
+//! because it doesn't overlap with any of the locations in the square brackets, whereas
+//! %keep_me_too` would be different to `%something_else`. This same `spill` system can
+//! be used when we need a specific register for e.g. `div`, simply emitting a `spill`
+//! before we emit the `div`. Although I've written the list of banned locations inline
+//! here, this will probably be implemented by having a single register class for each
+//! of the kinds of spilling we want to do (systemv calls, `div` instructions, etc) and
+//! just referencing them.
+//!
+//! -------------------------------------------------------------------------------------
+//!
+//! When we branch or do anything that uses a label, we want to be able to have a
+//! location that we can write to with the actual value of that label. Since in the
+//! current design, every instruction definition represents precisely one encoding of the
+//! instruction, we could have a system where we simply find out how much space we need
+//! for the instruction, then we take a note of which instruction definition we need to
+//! encode, what the arguments are (not including the ones we'll fill in later) and what
+//! our current encoding position is. When that label gets defined, we simply call back
+//! into the encoding function of that specific instruction definition and overwrite the
+//! whole instruction.
+//!
+//! To ensure that we don't accidentally write an instruction definition that can return
+//! encodings of different sizes depending on the arguments, we could have it so that the
+//! method to define a new instruction enforces that the supplied encoding function
+//! returns a fixed-size array (probably using a trait). We then don't even need to even
+//! call the function when we have relocations, we just get the size and fill it in with
+//! zeroes. That way, the assembler doesn't even need to know about the concept of
+//! relocations whatsoever.
+//!
+//! -------------------------------------------------------------------------------------
+//!
 //! A quick note: everywhere where we use `Vec` we'd ideally use some trickery to do
 //! everything on the stack and avoid allocation. Every allocation means work that
 //! cannot be done at compile-time and increased difficulty figuring out complexity. I
@@ -528,9 +644,9 @@ struct LowIRInstr<S> {
     inputs: Vec<VReg>,
 }
 
-impl<S> Directive<S> {
+impl<S> LowIRInstr<S> {
     fn new(name: VReg, output: Output<S>, inputs: Vec<VReg>) -> Self {
-        Directive {
+        LowIRInstr {
             name,
             output,
             inputs,
@@ -538,7 +654,7 @@ impl<S> Directive<S> {
     }
 }
 
-/// A machine-specific backend for Lightbeam. This generates a series of `Directive`s,
+/// A machine-specific backend for Lightbeam. This generates a series of `LowIRInstr`s,
 /// basically a simple register machine that maps closely to how a real machine works,
 /// but with register allocation and things like the `FLAGS` register abstracted away.
 /// This allows us to write 90% of instruction implementations in a architecture-
@@ -568,11 +684,11 @@ trait LightbeamBackend {
         regs: &mut impl Iterator<Item = VReg>,
         a: VReg,
         b: VReg,
-    ) -> (VReg, Vec<Directive<Self::Machine::SpecificOutput>>) {
+    ) -> (VReg, Vec<LowIRInstr<Self::Machine::SpecificOutput>>) {
         let ret = regs.next();
         (
             ret,
-            vec![Directive::new(ret, outputs::Generic::Add, vec![a, b])],
+            vec![LowIRInstr::new(ret, outputs::Generic::Add, vec![a, b])],
         )
     }
 }
