@@ -406,6 +406,8 @@
 //! have ideas of precisely how to constrain ourselves to the stack everywhere that we
 //! need to be, but to keep this sample code simple I've used `Vec` for now.
 
+mod machine;
+
 /// An argument constraint, this means that this input or output must be in a specific place.
 // TODO: We might want this to have some way to specify that the output needs to be a special
 //       register - `rip`, `FLAGS` etc. - or a specific section of memory (since x86 has
@@ -503,11 +505,11 @@ fn make_x64_specification() -> impl Machine {
     use outputs::Generic as G;
 
     // When we define `R0` etc, we should specify its size in bits
-    let int_reg_64 = RegClass::new([R0, R1, R2 /* ..snip.. */]);
-    // `r32` should be precisely equal to `.mask(0xFFFF)`
-    let int_reg_32 = RegClass::new([r32(R0), r32(R1), r32(R2) /* ..snip.. */]);
-    let float_reg_64 = RegClass::new([/* ..snip.. */]);
-    let imm32 = Immediate(32);
+    // We _don't_ specify masks here - registers as defined at this point must be non-overlapping,
+    // with masking and overlapping semantics defined at the level of the instructions.
+    const INT_REG: Constraint = RegClass::new([R0, R1, R2 /* ..snip.. */]);
+    const FLOAT_REG_64: Constraint = RegClass::new([/* ..snip.. */]);
+    const IMM32: Constraint = Immediate(32);
 
     // TODO: How to handle some registers overlapping with others? For example, some 32-bit
     //       instrs clobber the whole 64-bit reg, others leave the upper bits untouched.
@@ -521,15 +523,58 @@ fn make_x64_specification() -> impl Machine {
     // `anon!` is an external macro to create an anonymous struct and is just for convenience
     // here, basically acting like a namespace so we don't have to repeat `flags_cf`, `flags_pf`
     // etc - they're all in one place.
-    let flags = anon! {
-        cf: FLAGS.mask(0x1),
-        pf: FLAGS.mask(0x4),
-        af: FLAGS.mask(0x10),
-        zf: FLAGS.mask(0x40),
-        sf: FLAGS.mask(0x80),
-        // ..snip..
-        of: FLAGS.mask(0x800),
-    };
+    const FLAGS_CF: Constraint = FLAGS.mask(0x1);
+    const FLAGS_PF: Constraint = FLAGS.mask(0x4);
+    const FLAGS_AF: Constraint = FLAGS.mask(0x10);
+    const FLAGS_ZF: Constraint = FLAGS.mask(0x40);
+    const FLAGS_SF: Constraint = FLAGS.mask(0x80);
+    // ..snip..
+    const FLAGS_OF: Constraint = FLAGS.mask(0x800);
+
+    fn commutative<T, Out>(first: T, second: T, f: impl Fn(T, T) -> Out) -> impl Variants {
+        Variants::new().or(f(first, second)).or(f(second, first))
+    }
+
+    fn memory<Other, Out>(
+        other: Other,
+        encode_fn: impl Fn(Other, MemoryOperand) -> Out,
+    ) -> impl Variants {
+        Variants::new()
+            .or(Params::new(INT_REG)
+                .map(|(other, address)| Load(32).with([address]))
+                .encode(|(other, base)| {
+                    encode_fn(other, MemoryOperand::new(base, None, Immediate(0)))
+                }))
+            .or(Params::new((INT_REG, INT_REG))
+                .map(|(other, (base, index))| commutative(base, index, |a, b| Add(32).with([a, b])))
+                .map(|address| Load(32).with([address]))
+                .encode(|(other, (base, index))| {
+                    encode_fn(other, MemoryOperand::new(base, index, Immediate(0)))
+                }))
+            .or(Params::new((INT_REG, IMM32))
+                .map(|(base, disp)| commutative(base, disp, |a, b| Add(32).with([a, b])))
+                .encode(|(other, (base, disp))| {
+                    encode_fn(other, MemoryOperand::new(base, None, Immediate(disp)))
+                }))
+            .or(Params::new((INT_REG, INT_REG, IMM32))
+                .map(|(base, index, disp)| {
+                    commutative(base, index, |a, b| Add(32).with([a, b]))
+                        .map(|combined| commutative(combined, disp, |a, b| Add(32).with([a, b])))
+                })
+                .encode(|(other, (base, index, disp))| {
+                    encode_fn(other, MemoryOperand::new(base, index, Immediate(disp)))
+                }))
+            .or(Params::new((INT_REG, INT_REG, Immediate(3), IMM32))
+                .map(|(base, index, scale, disp)| {
+                    ShiftL(32)
+                        .with([index, scale])
+                        .map(|index| commutative(base, index, |a, b| Add(32).with([a, b])))
+                        .map(|combined| commutative(combined, disp, |a, b| Add(32).with([a, b])))
+                })
+                .encode(|(other, (base, index, scale, disp))| {
+                    encode_fn(other, MemoryOperand::new(base, (index,), Immediate(disp)))
+                }))
+    }
 
     // Since we want the set of outputs to be as minimal as possible, we'd ideally have equality defined
     // as `is_zero` on the output of a `sub`. However, having to rewrite that and remember that you have
@@ -539,43 +584,50 @@ fn make_x64_specification() -> impl Machine {
     // `is_zero` output that just point to the same destination - LIRC should still be able to easily
     // handle that correctly - but it's error-prone if we have to specify that every single time, when
     // we know that it will always be true that `a - b == 0` is the same as `a == b`.
-    MachineSpec::new()
+    SpecBuilder::new()
         .instr(
-            // This is the metadata section. This specifies everything that the query engine needs,
-            // so inputs, outputs, clobbers, commutativity, maybe even identity.
-            [
-                // These are the parameters that need to be reused in several outputs. To ensure that
-                // we only generate a single register for them we specify them literally here. You can
-                // only define outputs whose destination and inputs are references to inputs,
-                // references to other outputs or individual registers.
-                input(int_reg_32),
-                input(int_reg_32),
-                G::Add(32).output(Ref(0).mask(0x0000FFFF), [Ref(0), Ref(1)]),
-                // TODO: Is this really necessary? You could imagine it being used to implement constant-
-                //       folding when we do some kind of work with the upper bits of a zeroed register.
-                //
-                //       For now I think we should ignore the mask when trying to work out whether a
-                //       register is clobbered, and only care about it in simple cases like `FLAGS`.
-                G::Zero.output(Ref(0).mask(0xFFFF0000)),
-                G::Is0.output(flags.zf, [Ref(2)]),
-                G::Sign.output(flags.sf, [Ref(2)]),
-                G::Parity.output(flags.pf, [Ref(2)]),
-                // Unlike `Is0`/`Sign`/`Parity`, which are properties of the output, `overflow` and
-                // `carry` are properties of the add operation itself, so they get names that reflect
-                // that and take the add operands as parameters instead of the output (see the `[Ref(0),
-                // Ref(1)]` instead of `[Ref(2)]`). These are outputs that essentially represent whether
-                // this operation _would_ overflow were you to perform it, which is useful because
-                // something like `cmp` can tell you if subtraction will underflow without actually
-                // performing a subtraction. If you've requested a `SubUnderflow32` but not used the
-                // actual result of the `sub`, we can emit a `cmp` instead.
-                G::AddOverflow(32).output(flags.of, [Ref(0), Ref(1)]),
-                G::AddCarry(32).output(flags.cf, [Ref(0), Ref(1)]),
-            ],
-            // This is the encoding section. Although we need to write a different instruction definition
-            // for every form of the instruction (reg-reg, reg-mem, reg-imm, etc) we can trivially write
-            // a helper that has some higher-level form and converts it to multiple instruction
-            // definitions.
-            |args| encode::add32_r_r(args.at(0).reg()?, args.at(1).reg()?),
+            // This heirarchical representation just converts to a series of instruction
+            // definitions, each one being one form of the instruction. This means we can
+            // define memory-accessing forms of instructions relatively simply by using
+            // this `load` helper method instead of having to write out all the different
+            // possible forms of the instruction.
+            Params::new(INT_REG)
+                .map(|left| {
+                    let right = Variants::new()
+                        .or(memory(left, |left, right| encode_add32_r_m(left, right))
+                            .map(|val| Load(32).with([val])))
+                        // We don't need `.map` because we just want the register as-is
+                        .or(Params::new(INT_REG)
+                            .encode(|(left, right)| encode::add32_r_r(left, right)));
+
+                    // TODO: Although we mark this as commutative here, we still need
+                    //       to have a separate form of this instruction that includes the
+                    //       store. This instruction is only `add r32, r/m32` and we need a
+                    //       separate `add m32, r32`. `commutative` only marks us as valid to
+                    //       rearrange, so `%0 = add %1, %2` will choose this instruction if
+                    //       `%1` is a memory access instead of only if `%2` is a memory
+                    //       access.
+                    right.map(|right| {
+                        commutative(left, right, |a, b| {
+                            (
+                                Add(32).with([a, b]).output(left),
+                                AddOverflow(32).with([a, b]).output(FLAGS_OF),
+                                AddCarry(32).with([a, b]).output(FLAGS_CF),
+                                // TODO: I don't think we ever need this
+                                AddAdjust.with([a, b]).output(FLAGS_AF),
+                            )
+                        })
+                    })
+                })
+                .map(|(add, _, _)| {
+                    Params::new((FLAGS_ZF, FLAGS_PF, FLAGS_SF)).map(|zf, pf, sf| {
+                        (
+                            IsZero.with([add]).output(FLAGS_ZF),
+                            Parity.with([add]).output(FLAGS_PF),
+                            Sign.with([add]).output(FLAGS_SF),
+                        )
+                    })
+                }),
         )
         .instr(
             // Since both adds are commutative in this instruction we'd need to generate several versions
@@ -587,13 +639,13 @@ fn make_x64_specification() -> impl Machine {
                 input(int_reg_32), // INDEX
                 input(imm3),       // SCALE
                 // load(BASE + (INDEX << SCALE) + DISP)
-                G::Load32.output(Ref(0), [Ref(6)]),
+                G::Load(32).output(Ref(0), [Ref(6)]),
                 // BASE + (INDEX << SCALE) + DISP
-                G::Add32.output(INTERNAL, [Ref(2), Ref(7)]),
+                G::Add(32).output(INTERNAL, [Ref(2), Ref(7)]),
                 // (INDEX << SCALE) + DISP
-                G::Add32.output(INTERNAL, [Ref(1), Ref(8)]),
+                G::Add(32).output(INTERNAL, [Ref(1), Ref(8)]),
                 // INDEX << SCALE
-                G::ShiftL32.output(INTERNAL, [Ref(3), Ref(4)]),
+                G::ShiftL(32).output(INTERNAL, [Ref(3), Ref(4)]),
             ],
             |args| {
                 let dest = args.at(0);
