@@ -424,6 +424,7 @@ pub mod outputs {
 
 pub fn make_x64_specification() -> MachineSpec<'static, self::outputs::Generic> {
     use self::outputs::Generic as G;
+    use generic_array::arr;
 
     trait InstrBuilderExt {
         fn memory(&mut self) -> Var;
@@ -477,52 +478,36 @@ pub fn make_x64_specification() -> MachineSpec<'static, self::outputs::Generic> 
     // with masking and overlapping semantics defined at the level of the instructions.
     const INT_REG: RegClass = RegClass(&[R0, R1, R2 /* ..snip.. */]);
 
-    MachineSpec::new().instr(|new| {
-        let [left_in, left_out] = new
-            .variants::<typenum::consts::U2>()
-            .or(|[left_in, left_out], new| {
-                let value = new.param(INT_REG);
-                new.eq(left_in, value);
-                new.eq(left_out, value);
-            })
-            .or(|[left_in, left_out], new| {
-                let mem = new.memory();
+    MachineSpec::new()
+        .instr("add r, r", |new| {
+            let left = new.param(INT_REG);
 
-                new.action_into(left_in, G::Load, generic_array::arr![mem]);
-                new.action(G::Store, generic_array::arr![mem, left_out]);
-            })
-            .finish();
+            let right = new.param(INT_REG);
+            let out = new.action(G::Add32, arr![left, right]);
+            new.eq(left, out);
+        })
+        .instr("add m, r", |new| {
+            let left_addr = new.memory();
+            let right = new.param(INT_REG);
 
-        let right = new.param(INT_REG);
-        new.action_into(left_out, G::Add32, generic_array::arr![left_in, right]);
-    })
+            let left = new.action(G::Load, arr![left_addr]);
+            let out = new.action(G::Add32, arr![left, right]);
+            new.action(G::Store, arr![out]);
+        })
+        .instr("add r, m", |new| {
+            let left = new.param(INT_REG);
+            let right_addr = new.memory();
+
+            let right = new.action(G::Load, arr![right_addr]);
+            let out = new.action(G::Add32, arr![left, right]);
+            new.eq(out, left);
+        })
 }
 
 #[cfg(test)]
 mod test {
     #[test]
     fn x64_is_correct() {
-        use crate::machine::*;
-
-        let spec = crate::make_x64_specification();
-
-        #[derive(Debug, PartialEq)]
-        struct Instr {
-            params: Vec<Param<'static>>,
-            actions: Vec<Action<crate::outputs::Generic>>,
-            equality: Vec<(Var, Var)>,
-        }
-
-        println!("{:#?}", spec);
-
-        for i in spec.instrs_iter().map(|instr| Instr {
-            params: instr.params().collect(),
-            actions: instr.actions().cloned().collect(),
-            equality: instr.equality().collect(),
-        }) {
-            println!("{:#?}", i);
-        }
-
-        panic!()
+        panic!("{}", crate::make_x64_specification());
     }
 }

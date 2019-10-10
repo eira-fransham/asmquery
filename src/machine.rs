@@ -1,6 +1,6 @@
 use generic_array::{sequence::GenericSequence, ArrayLength, GenericArray, IntoArray};
 use smallbitvec::SmallBitVec;
-use std::io;
+use std::{fmt, io};
 
 /// The only important thing about registers is that they don't overlap, so we can just use an
 /// opaque ID.
@@ -61,6 +61,12 @@ pub struct Var {
     id: usize,
 }
 
+impl Var {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param<'a> {
     pub var: Var,
@@ -84,12 +90,17 @@ type ActionIter<'borrow, T> = impl Clone + Iterator<Item = &'borrow Action<T>> +
 type EqualityIter<'borrow> = impl Clone + Iterator<Item = (Var, Var)> + 'borrow;
 
 pub struct InstrDef<'borrow, 'a: 'borrow, T: 'borrow> {
+    name: &'a str,
     params: ParamIter<'borrow, 'a>,
     actions: ActionIter<'borrow, T>,
     equality: EqualityIter<'borrow>,
 }
 
 impl<'borrow, 'a, T> InstrDef<'borrow, 'a, T> {
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+
     pub fn params(&self) -> impl Iterator<Item = Param<'a>> + 'borrow {
         self.params.clone()
     }
@@ -108,7 +119,8 @@ impl<'borrow, 'a, T> InstrDef<'borrow, 'a, T> {
 }
 
 #[derive(Debug, Clone)]
-struct InstrDefInternal {
+struct InstrDefInternal<'a> {
+    name: &'a str,
     params: (usize, SmallBitVec),
     actions: (usize, SmallBitVec),
     equality: (usize, SmallBitVec),
@@ -119,12 +131,45 @@ pub struct MachineSpec<'a, T> {
     params: Vec<Param<'a>>,
     actions: Vec<Action<T>>,
     equality: Vec<(Var, Var)>,
-    instrs: Vec<InstrDefInternal>,
+    instrs: Vec<InstrDefInternal<'a>>,
 }
 
 impl<T> Default for MachineSpec<'_, T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Display for MachineSpec<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for instr in self.instrs_iter() {
+            writeln!(f, "{}:", instr.name())?;
+            writeln!(
+                f,
+                "  PARAMS: {:?}",
+                instr.params().map(|p| p.var.id()).collect::<Vec<_>>()
+            )?;
+            writeln!(f, "  ACTIONS:")?;
+            for (l, r) in instr.equality() {
+                writeln!(f, "    {} = {} ", l.id(), r.id())?;
+            }
+            for Action {
+                dest,
+                action,
+                inputs,
+            } in instr.actions()
+            {
+                writeln!(
+                    f,
+                    "    {} = {:?} {:?}",
+                    dest.id(),
+                    action,
+                    inputs.iter().map(|v| v.id()).collect::<Vec<_>>()
+                )?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -173,6 +218,7 @@ impl<'a, T> MachineSpec<'a, T> {
         }
 
         self.instrs.iter().map(move |instr| InstrDef {
+            name: instr.name,
             params: param_type_alias_hack(
                 if instr.params.1.is_empty() {
                     &[]
@@ -200,11 +246,11 @@ impl<'a, T> MachineSpec<'a, T> {
         })
     }
 
-    pub fn instr<F>(self, func: F) -> Self
+    pub fn instr<F>(self, name: &'a str, func: F) -> Self
     where
         F: FnOnce(&mut InstrBuilder<'a, T>),
     {
-        let mut builder = InstrBuilder::new();
+        let mut builder = InstrBuilder::new(name);
 
         func(&mut builder);
 
@@ -221,6 +267,7 @@ impl<'a, T> MachineSpec<'a, T> {
         self.equality.extend(other.equality);
         self.instrs
             .extend(other.instrs.into_iter().map(|instr| InstrDefInternal {
+                name: instr.name,
                 params: (params_offset + instr.params.0, instr.params.1),
                 actions: (actions_offset + instr.actions.0, instr.actions.1),
                 equality: (equality_offset + instr.equality.0, instr.equality.1),
@@ -244,19 +291,22 @@ impl VariableBuilder {
 }
 
 pub struct InstrBuilder<'a, T> {
+    name: &'a str,
     variable_builder: VariableBuilder,
     inner: MachineSpec<'a, T>,
 }
 
-impl<T> InstrBuilder<'_, T> {
-    fn new() -> Self {
+impl<'a, T> InstrBuilder<'a, T> {
+    fn new(name: &'a str) -> Self {
         let mut inner = MachineSpec::new();
         inner.instrs.push(InstrDefInternal {
+            name,
             params: (0, Default::default()),
             actions: (0, Default::default()),
             equality: (0, Default::default()),
         });
         InstrBuilder {
+            name,
             variable_builder: Default::default(),
             inner,
         }
@@ -267,6 +317,10 @@ impl<'a, T> InstrBuilder<'a, T>
 where
     T: Clone,
 {
+    pub fn var(&mut self) -> Var {
+        self.variable_builder.next()
+    }
+
     pub fn param(&mut self, bound: impl Into<Bound<'a>>) -> Var {
         let bound = bound.into();
         let var = self.variable_builder.next();
@@ -406,7 +460,7 @@ where
     where
         F: FnOnce(V::Array, &mut InstrBuilder<T>),
     {
-        let mut builder = InstrBuilder::new();
+        let mut builder = InstrBuilder::new(self.builder.name);
         builder.variable_builder = self.variable_builder.clone();
 
         func(self.variables.clone().into_array(), &mut builder);
@@ -440,7 +494,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action<T> {
-    dest: Var,
-    action: T,
-    inputs: Vec<Var>,
+    pub dest: Var,
+    pub action: T,
+    pub inputs: Vec<Var>,
 }
