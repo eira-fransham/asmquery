@@ -410,7 +410,10 @@
 
 mod machine;
 
-use machine::*;
+pub use machine::{
+    Action, EncodeArg, EncodeError, EncodeResult, Immediate, InstrBuilder, InstrDef, MachineSpec,
+    Param, Reg, RegClass, Var, Variants,
+};
 
 pub mod outputs {
     #[derive(Clone, Debug, PartialEq, Eq)]
