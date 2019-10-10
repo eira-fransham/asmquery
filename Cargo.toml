@@ -7,5 +7,8 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-chain-one = "0.1"
 hlist = "0.1"
+smallbitvec = "2.4"
+generic-array = { git = "https://github.com/Vurich/generic-array.git" }
+lazy_static = "1.4"
+typenum = "1.11"

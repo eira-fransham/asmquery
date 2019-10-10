@@ -406,341 +406,123 @@
 //! have ideas of precisely how to constrain ourselves to the stack everywhere that we
 //! need to be, but to keep this sample code simple I've used `Vec` for now.
 
+#![feature(const_fn, type_alias_impl_trait)]
+
 mod machine;
 
-/// An argument constraint, this means that this input or output must be in a specific place.
-// TODO: We might want this to have some way to specify that the output needs to be a special
-//       register - `rip`, `FLAGS` etc. - or a specific section of memory (since x86 has
-//       different instructions depending on how big your memory operand is). The only thing
-//       it shouldn't care about is concerns that span more than one query, such as data flow
-struct Constraint {
-    reg: bool,
-    mem: bool,
-    imm: bool,
-}
+use machine::*;
 
-/// Any value that can be obtained from some number of other values. This is an "output" and
-/// not an "instruction", as there is a many-to-many relationship between outputs and
-/// instructions - instructions can have many outputs, and it could be possible to obtain a
-/// given output through one of many different instructions.
-///
-/// TODO: We should be able to specify constant folding rules for `Output`s, and just add a
-///       step to the algorithm that greedily folds constants together if both arguments
-///       are constants. This should be far, far less error-prone than the current constant
-///       folding system.
-enum Output<S> {
-    Generic(outputs::Generic),
-    Specific(S),
-}
-
-// TODO: Handle instructions that don't return a value, like `jmp`, `return`, `ud2` etc.
-//       Probably this can be handled like other outputs, but where the output is of
-//       the bottom type (i.e. a dummy invalid type) and so matches all constraints.
-struct Query<S>(Output<S>, Constraint, Vec<Constraint>);
-
-/// A structure that represents a list of candidate instructions that can be refined by
-/// applying further queries. This should be a bitfield of some kind.
-struct Matches<S> {/* ..TODO.. */}
-
-impl<S> Matches<S> {
-    // Get the intersection of two sets of matches
-    fn merge(self, other: Self) -> Self {
-        unimplemented!()
-    }
-
-    // Iterate through the indices of matches
-    // TODO: Should we have `Matches` be able to directly return an iterator of instruction
-    //       definitions instead of requiring Lightbeam to index into the machine manually?
-    fn iter(&self) -> impl Iterator<Item = usize> {
-        unimplemented!()
+pub mod outputs {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Generic {
+        Store,
+        Load,
+        Add32,
+        ShiftL32,
     }
 }
 
-/// A machine specification
-trait Machine {
-    /// Type of machine-specific outputs
-    type SpecificOutput;
+pub fn make_x64_specification() -> MachineSpec<'static, self::outputs::Generic> {
+    use self::outputs::Generic as G;
 
-    /// Machines should be stateless, so we use `&` here, but it's possible that
-    /// we might want to use `&mut` in the future.
-    // This should just return a bitfield with all bits set.
-    // TODO: This should be a const fn, right now Rust has no way to have
-    //       `const fn`s in traits but there are ways around that.
-    fn query(&self, query: Query<Self::SpecificOutput>) -> Matches<S>;
-}
+    trait InstrBuilderExt {
+        fn memory(&mut self) -> Var;
+    }
 
-// I've chosen to write an embedded DSL here, so that we don't have to write
-// blit-a-string-to-a-file-style codegen, but we could totally have this be an
-// external DSL like in GCC instead. Writing the codegen would be more of a
-// hassle and make compile-times worse though, and I think that an eDSL like
-// this would work better for our usecase.
-//
-// If we carefully use `const fn` and the type system, this should compile to
-// code as good as if we had hand-rolled it or written codegen.
-//
-// TODO: How do we handle control flow? The assembler should only expose very
-//       simple functions around this and leave stuff like calling conventions
-//       to Lightbeam, but how do we represent stuff like `je` vs `jle` and
-//       so forth in a way that compiles to efficient code on x86, ARM, etc.
-//
-// TODO: Lightbeam currently makes heavy use of `push`/`pop`, but not all
-//       architectures have this. We want to use these instructions on x86
-//       since they're _far_ faster than manually reserving stack space, but
-//       we ideally want other architectures without these instructions to
-//       be able to reserve stack space in steps (e.g. powers of two).
-//       Maybe this can just be a flag in the machine specification? Another
-//       possibility is having a `stack_space_increment` function in the
-//       `LightbeamBackend` trait that returns the step by which to increment
-//       the amount of space reserved on the stack. The x64 machine spec
-//       could then simply define `push` as an instruction with 2 outputs -
-//       the memory location at `[rsp]`, where the input is moved, and `rsp`
-//       itself, which is incremented by 8. Lightbeam just needs to request the
-//       value to be moved and the stack pointer to be incremented by 8 and
-//       the query refinement algorithm will take care of the rest. We could
-//       have the same code to write to stack and increment by some amount for
-//       both ARM64 and x64 and have the query refinement algorithm handle
-//       converting this to a `mov` + `sub` on the former and a `push` on the
-//       latter.
-fn make_x64_specification() -> impl Machine {
-    use outputs::Generic as G;
+    impl InstrBuilderExt for InstrBuilder<'_, self::outputs::Generic> {
+        fn memory(&mut self) -> Var {
+            self.variants::<typenum::consts::U1>()
+                .or(|[out], new| {
+                    let address = new.param(INT_REG);
+                    new.eq(out, address);
+                })
+                .or(|[out], new| {
+                    let base = new.param(INT_REG);
+                    let index = new.param(INT_REG);
+                    new.action_into(out, G::Add32, vec![base, index]);
+                })
+                .or(|[out], new| {
+                    let base = new.param(INT_REG);
+                    let disp = new.param(Immediate { bits: 32 });
+                    new.action_into(out, G::Add32, vec![base, disp]);
+                })
+                .or(|[out], new| {
+                    let base = new.param(INT_REG);
+                    let index = new.param(INT_REG);
+                    let disp = new.param(Immediate { bits: 32 });
+                    let intermediate = new.action(G::Add32, vec![base, index]);
+                    new.action_into(out, G::Add32, vec![intermediate, disp]);
+                })
+                .or(|[out], new| {
+                    let base = new.param(INT_REG);
+
+                    let index = new.param(INT_REG);
+                    let scale = new.param(Immediate { bits: 3 });
+                    let shifted_index = new.action(G::ShiftL32, vec![index, scale]);
+
+                    let disp = new.param(Immediate { bits: 32 });
+                    let intermediate = new.action(G::Add32, vec![base, shifted_index]);
+                    new.action_into(out, G::Add32, vec![intermediate, disp]);
+                })
+                .finish()[0]
+        }
+    }
+
+    regs! {
+        R0, R1, R2
+    }
 
     // When we define `R0` etc, we should specify its size in bits
     // We _don't_ specify masks here - registers as defined at this point must be non-overlapping,
     // with masking and overlapping semantics defined at the level of the instructions.
-    const INT_REG: Constraint = RegClass::new([R0, R1, R2 /* ..snip.. */]);
-    const FLOAT_REG_64: Constraint = RegClass::new([/* ..snip.. */]);
-    const IMM32: Constraint = Immediate(32);
+    const INT_REG: RegClass = RegClass(&[R0, R1, R2 /* ..snip.. */]);
 
-    // TODO: How to handle some registers overlapping with others? For example, some 32-bit
-    //       instrs clobber the whole 64-bit reg, others leave the upper bits untouched.
-    //       Maybe we just don't handle it at all for now, since although it could lead to
-    //       better codegen it's not necessary for correctness AFAIK.
-    //
-    // This separation of the place that we store, say, the carry flag (i.e. FLAGS & 0x1)
-    // with the actual `G::Carry` output that it represents means that we can handle
-    // instructions that use the same bit to mean different things
-    //
-    // `anon!` is an external macro to create an anonymous struct and is just for convenience
-    // here, basically acting like a namespace so we don't have to repeat `flags_cf`, `flags_pf`
-    // etc - they're all in one place.
-    const FLAGS_CF: Constraint = FLAGS.mask(0x1);
-    const FLAGS_PF: Constraint = FLAGS.mask(0x4);
-    const FLAGS_AF: Constraint = FLAGS.mask(0x10);
-    const FLAGS_ZF: Constraint = FLAGS.mask(0x40);
-    const FLAGS_SF: Constraint = FLAGS.mask(0x80);
-    // ..snip..
-    const FLAGS_OF: Constraint = FLAGS.mask(0x800);
+    MachineSpec::new().instr(|new| {
+        let [left_in, left_out] = new
+            .variants::<typenum::consts::U2>()
+            .or(|[left_in, left_out], new| {
+                let value = new.param(INT_REG);
+                new.eq(left_in, value);
+                new.eq(left_out, value);
+            })
+            .or(|[left_in, left_out], new| {
+                let mem = new.memory();
 
-    fn commutative<T, Out>(first: T, second: T, f: impl Fn(T, T) -> Out) -> impl Variants {
-        Variants::new().or(f(first, second)).or(f(second, first))
-    }
+                new.action_into(left_in, G::Load, generic_array::arr![mem]);
+                new.action(G::Store, generic_array::arr![mem, left_out]);
+            })
+            .finish();
 
-    fn memory<Other, Out>(
-        other: Other,
-        encode_fn: impl Fn(Other, MemoryOperand) -> Out,
-    ) -> impl Variants {
-        Variants::new()
-            .or(Params::new(INT_REG)
-                .map(|(other, address)| Load(32).with([address]))
-                .encode(|(other, base)| {
-                    encode_fn(other, MemoryOperand::new(base, None, Immediate(0)))
-                }))
-            .or(Params::new((INT_REG, INT_REG))
-                .map(|(other, (base, index))| commutative(base, index, |a, b| Add(32).with([a, b])))
-                .map(|address| Load(32).with([address]))
-                .encode(|(other, (base, index))| {
-                    encode_fn(other, MemoryOperand::new(base, index, Immediate(0)))
-                }))
-            .or(Params::new((INT_REG, IMM32))
-                .map(|(base, disp)| commutative(base, disp, |a, b| Add(32).with([a, b])))
-                .encode(|(other, (base, disp))| {
-                    encode_fn(other, MemoryOperand::new(base, None, Immediate(disp)))
-                }))
-            .or(Params::new((INT_REG, INT_REG, IMM32))
-                .map(|(base, index, disp)| {
-                    commutative(base, index, |a, b| Add(32).with([a, b]))
-                        .map(|combined| commutative(combined, disp, |a, b| Add(32).with([a, b])))
-                })
-                .encode(|(other, (base, index, disp))| {
-                    encode_fn(other, MemoryOperand::new(base, index, Immediate(disp)))
-                }))
-            .or(Params::new((INT_REG, INT_REG, Immediate(3), IMM32))
-                .map(|(base, index, scale, disp)| {
-                    ShiftL(32)
-                        .with([index, scale])
-                        .map(|index| commutative(base, index, |a, b| Add(32).with([a, b])))
-                        .map(|combined| commutative(combined, disp, |a, b| Add(32).with([a, b])))
-                })
-                .encode(|(other, (base, index, scale, disp))| {
-                    encode_fn(other, MemoryOperand::new(base, (index,), Immediate(disp)))
-                }))
-    }
-
-    // Since we want the set of outputs to be as minimal as possible, we'd ideally have equality defined
-    // as `is_zero` on the output of a `sub`. However, having to rewrite that and remember that you have
-    // to implement equality that way in every new machine spec is tedious. What we really want is to
-    // have a way to abstract this way. My idea is to have each element of the output array be an
-    // iterator. As far as I know, there's no harm in specifying _both_ an `eq` output and a `sub`-with-
-    // `is_zero` output that just point to the same destination - LIRC should still be able to easily
-    // handle that correctly - but it's error-prone if we have to specify that every single time, when
-    // we know that it will always be true that `a - b == 0` is the same as `a == b`.
-    SpecBuilder::new()
-        .instr(
-            // This heirarchical representation just converts to a series of instruction
-            // definitions, each one being one form of the instruction. This means we can
-            // define memory-accessing forms of instructions relatively simply by using
-            // this `load` helper method instead of having to write out all the different
-            // possible forms of the instruction.
-            Params::new(INT_REG)
-                .map(|left| {
-                    let right = Variants::new()
-                        .or(memory(left, |left, right| encode_add32_r_m(left, right))
-                            .map(|val| Load(32).with([val])))
-                        // We don't need `.map` because we just want the register as-is
-                        .or(Params::new(INT_REG)
-                            .encode(|(left, right)| encode::add32_r_r(left, right)));
-
-                    // TODO: Although we mark this as commutative here, we still need
-                    //       to have a separate form of this instruction that includes the
-                    //       store. This instruction is only `add r32, r/m32` and we need a
-                    //       separate `add m32, r32`. `commutative` only marks us as valid to
-                    //       rearrange, so `%0 = add %1, %2` will choose this instruction if
-                    //       `%1` is a memory access instead of only if `%2` is a memory
-                    //       access.
-                    right.map(|right| {
-                        commutative(left, right, |a, b| {
-                            (
-                                Add(32).with([a, b]).output(left),
-                                AddOverflow(32).with([a, b]).output(FLAGS_OF),
-                                AddCarry(32).with([a, b]).output(FLAGS_CF),
-                                // TODO: I don't think we ever need this
-                                AddAdjust.with([a, b]).output(FLAGS_AF),
-                            )
-                        })
-                    })
-                })
-                .map(|(add, _, _)| {
-                    Params::new((FLAGS_ZF, FLAGS_PF, FLAGS_SF)).map(|zf, pf, sf| {
-                        (
-                            IsZero.with([add]).output(FLAGS_ZF),
-                            Parity.with([add]).output(FLAGS_PF),
-                            Sign.with([add]).output(FLAGS_SF),
-                        )
-                    })
-                }),
-        )
-        .instr(
-            // Since both adds are commutative in this instruction we'd need to generate several versions
-            // of it with the parameters in different orders.
-            [
-                input(int_reg_32), // DEST
-                input(imm32),      // DISP
-                input(int_reg_32), // BASE
-                input(int_reg_32), // INDEX
-                input(imm3),       // SCALE
-                // load(BASE + (INDEX << SCALE) + DISP)
-                G::Load(32).output(Ref(0), [Ref(6)]),
-                // BASE + (INDEX << SCALE) + DISP
-                G::Add(32).output(INTERNAL, [Ref(2), Ref(7)]),
-                // (INDEX << SCALE) + DISP
-                G::Add(32).output(INTERNAL, [Ref(1), Ref(8)]),
-                // INDEX << SCALE
-                G::ShiftL(32).output(INTERNAL, [Ref(3), Ref(4)]),
-            ],
-            |args| {
-                let dest = args.at(0);
-                let disp = args.at(1);
-                let base = args.at(2);
-                let index = args.at(3);
-                let scale = args.at(4);
-
-                encode::mov32_r_m(dest.reg()?, Mem32(base, index, scale, disp))
-            },
-        )
-        // With x86 jumps, there are instructions that do both a logical op and the jump itself.
-        // `ja` is defined to jump if CF = 0 _and_ ZF = 0. It also has an instruction to jump
-        // if `ECX` is 0.
-        .instr(
-            [
-                input(int_reg_32),
-                // TODO: Should this be an actual output or should we have a separate category for
-                //       operations that don't produce anything? Or, should we represent this as a
-                //       conditional move into `rip`?
-                G::JumpIf.output(.., [Ref(2), Ref(0)]),
-                // Even though the internal `And` is commutative, we don't need to generate two versions
-                // of this instruction because both these inputs are fixed.
-                G::And(1).output(INTERNAL, [flags.cf, flags.zf]),
-            ],
-            |a, b| { /* TODO */ },
-        )
+        let right = new.param(INT_REG);
+        new.action_into(left_out, G::Add32, generic_array::arr![left_in, right]);
+    })
 }
 
-/// A virtual register, used by Lightbeam's generic backend to track the flow of data
-/// separate from the actual registers that are used on the machine.
-struct VReg(usize);
+#[cfg(test)]
+mod test {
+    #[test]
+    fn x64_is_correct() {
+        use crate::machine::*;
 
-/// A single instruction in Low IR. This is a RISC instruction set where each `Output`
-/// specification corresponds to multiple instructions that could theoretically
-/// produce that output. See module documentation for a better description.
-struct LowIRInstr<S> {
-    /// The name to give this specific output
-    name: VReg,
-    /// The output that we want
-    output: Output<S>,
-    /// The inputs that this output needs
-    // TODO: This should include a "dead value" flag to explicitly mark the final use
-    //       of a value. This makes location reuse explicit (replacing the ad-hoc
-    //       `take`/`release` system in Lightbeam's current backend) and since every
-    //       value has a unique ID we can have debug-mode assertions that ensure that
-    //       we have no double-frees or dangling values.
-    inputs: Vec<VReg>,
-}
+        let spec = crate::make_x64_specification();
 
-impl<S> LowIRInstr<S> {
-    fn new(name: VReg, output: Output<S>, inputs: Vec<VReg>) -> Self {
-        LowIRInstr {
-            name,
-            output,
-            inputs,
+        #[derive(Debug, PartialEq)]
+        struct Instr {
+            params: Vec<Param<'static>>,
+            actions: Vec<Action<crate::outputs::Generic>>,
+            equality: Vec<(Var, Var)>,
         }
-    }
-}
 
-/// A machine-specific backend for Lightbeam. This generates a series of `LowIRInstr`s,
-/// basically a simple register machine that maps closely to how a real machine works,
-/// but with register allocation and things like the `FLAGS` register abstracted away.
-/// This allows us to write 90% of instruction implementations in a architecture-
-/// agnostic way, with the remaining 10% either implemented with library calls or
-/// using architecture-specific instructions.
-trait LightbeamBackend {
-    /// The machine specification type for this backend. This means that generic code
-    /// can accept a `LightbeamBackend` and handle everything generically.
-    type Machine: Machine;
+        println!("{:#?}", spec);
 
-    // `impl Trait` syntax is currently not implemented for traits but there are ways
-    // around that limitation and it makes this code easier to read for now.
-    //
-    // We'd probably use `dyn Trait` to start with to prevent having many, many type
-    // parameters, but there are definitely better ways. Probably the ideal solution
-    // is to use generators, but those too are still unstable.
-    //
-    // The body of this function is defined in the trait itself - we can give default
-    // implementations of any instruction that doesn't need anything machine-specific,
-    // and theoretically for anything that _does_ need machine-specific instructions, we
-    // can use a library of implementations in Rust that we call out to. This should
-    // make it easy to add new backends, where replacing a slow implementation that
-    // compiles to a function call with native code is as easy as overriding a function
-    // in the trait impl.
-    /// Add two numbers together
-    fn add(
-        regs: &mut impl Iterator<Item = VReg>,
-        a: VReg,
-        b: VReg,
-    ) -> (VReg, Vec<LowIRInstr<Self::Machine::SpecificOutput>>) {
-        let ret = regs.next();
-        (
-            ret,
-            vec![LowIRInstr::new(ret, outputs::Generic::Add, vec![a, b])],
-        )
+        for i in spec.instrs_iter().map(|instr| Instr {
+            params: instr.params().collect(),
+            actions: instr.actions().cloned().collect(),
+            equality: instr.equality().collect(),
+        }) {
+            println!("{:#?}", i);
+        }
+
+        panic!()
     }
 }
