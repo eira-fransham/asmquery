@@ -22,12 +22,12 @@ impl Reg {
 
 #[macro_export]
 macro_rules! regs {
-    ($name:ident) => {
-        const $name: $crate::machine::Reg = $crate::machine::Reg::from_id(0);
+    ($v:vis $name:ident) => {
+        $v const $name: $crate::machine::Reg = $crate::machine::Reg::from_id(0);
     };
-    ($first:ident, $second:ident $(, $rest:ident)*) => {
-        regs!($second $(, $rest)*);
-        const $first: $crate::machine::Reg = $crate::machine::Reg::from_id($second.id() + 1);
+    ($v:vis $first:ident, $second:ident $(, $rest:ident)*) => {
+        $crate::regs!($v $second $(, $rest)*);
+        $v const $first: $crate::machine::Reg = $crate::machine::Reg::from_id($second.id() + 1);
     };
 }
 
@@ -44,9 +44,18 @@ pub enum Bound<'a> {
     Imm(Immediate),
 }
 
-impl<'a> From<RegClass<'a>> for Bound<'a> {
-    fn from(other: RegClass<'a>) -> Self {
-        Bound::Reg(other)
+impl<'a, T> From<T> for Bound<'a>
+where
+    T: Into<RegClass<'a>>,
+{
+    fn from(other: T) -> Self {
+        Bound::Reg(other.into())
+    }
+}
+
+impl<'a> From<&'a Reg> for RegClass<'a> {
+    fn from(other: &'a Reg) -> Self {
+        RegClass(std::slice::from_ref(other))
     }
 }
 
@@ -57,6 +66,7 @@ impl From<Immediate> for Bound<'_> {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct Var {
     id: usize,
 }
@@ -68,6 +78,7 @@ impl Var {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub struct Param<'a> {
     pub var: Var,
     pub bound: Bound<'a>,
@@ -313,6 +324,25 @@ impl<'a, T> InstrBuilder<'a, T> {
     }
 }
 
+pub trait Location<'a> {
+    fn make<T: Clone>(self, ctx: &mut InstrBuilder<'a, T>) -> Var;
+}
+
+impl<'a> Location<'a> for Var {
+    fn make<T: Clone>(self, _: &mut InstrBuilder<'a, T>) -> Var {
+        self
+    }
+}
+
+impl<'a, B> Location<'a> for B
+where
+    B: Into<Bound<'a>>,
+{
+    fn make<T: Clone>(self, ctx: &mut InstrBuilder<'a, T>) -> Var {
+        ctx.param(self)
+    }
+}
+
 impl<'a, T> InstrBuilder<'a, T>
 where
     T: Clone,
@@ -361,14 +391,14 @@ where
         self.inner.equality.push((a, b));
     }
 
-    pub fn action(&mut self, action: T, inputs: impl IntoIterator<Item = Var>) -> Var {
+    pub fn action(&mut self, action: T, inputs: impl AsRef<[Var]>) -> Var {
         let new_variable = self.variable_builder.next();
         self.action_into(new_variable, action, inputs);
         new_variable
     }
 
-    pub fn action_into(&mut self, dest: Var, action: T, inputs: impl IntoIterator<Item = Var>) {
-        let inputs = inputs.into_iter().collect();
+    pub fn action_into<L: Location<'a>>(&mut self, dest: L, action: T, inputs: impl AsRef<[Var]>) {
+        let dest = dest.make(self);
 
         for InstrDefInternal {
             actions: (offset, mask),
@@ -387,7 +417,7 @@ where
         self.inner.actions.push(Action {
             dest: dest,
             action: action,
-            inputs,
+            inputs: inputs.as_ref().iter().cloned().collect(),
         });
     }
 

@@ -415,102 +415,284 @@ pub use machine::{
     Param, Reg, RegClass, Var, Variants,
 };
 
-pub mod outputs {
-    #[derive(Clone, Debug, PartialEq, Eq)]
+pub mod actions {
+    pub type Bits = u8;
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Generic {
-        Store,
-        Load,
-        Add32,
-        ShiftL32,
+        Store { input: Bits, mem_size: Bits },
+        Load { out: Bits, mem_size: Bits },
+        OverflowSigned,
+        OverflowUnsigned,
+        Add(Bits),
+        AddOverflowS(Bits),
+        AddOverflowU(Bits),
+        ShiftL(Bits),
+        Sub(Bits),
+        SubOverflowS(Bits),
+        SubOverflowU(Bits),
+        IsZero,
+        LtZero,
     }
 }
 
-pub fn make_x64_specification() -> MachineSpec<'static, self::outputs::Generic> {
-    use self::outputs::Generic as G;
-    use generic_array::arr;
+pub mod x64 {
+    use crate::actions::{Bits, Generic as G};
+    use crate::machine::{Immediate, InstrBuilder, MachineSpec, RegClass, Var};
 
-    trait InstrBuilderExt {
-        fn memory(&mut self) -> Var;
-    }
-
-    impl InstrBuilderExt for InstrBuilder<'_, self::outputs::Generic> {
-        fn memory(&mut self) -> Var {
-            self.variants::<typenum::consts::U1>()
-                .or(|[out], new| {
-                    let address = new.param(INT_REG);
-                    new.eq(out, address);
-                })
-                .or(|[out], new| {
-                    let base = new.param(INT_REG);
-                    let index = new.param(INT_REG);
-                    new.action_into(out, G::Add32, vec![base, index]);
-                })
-                .or(|[out], new| {
-                    let base = new.param(INT_REG);
-                    let disp = new.param(Immediate { bits: 32 });
-                    new.action_into(out, G::Add32, vec![base, disp]);
-                })
-                .or(|[out], new| {
-                    let base = new.param(INT_REG);
-                    let index = new.param(INT_REG);
-                    let disp = new.param(Immediate { bits: 32 });
-                    let intermediate = new.action(G::Add32, vec![base, index]);
-                    new.action_into(out, G::Add32, vec![intermediate, disp]);
-                })
-                .or(|[out], new| {
-                    let base = new.param(INT_REG);
-
-                    let index = new.param(INT_REG);
-                    let scale = new.param(Immediate { bits: 3 });
-                    let shifted_index = new.action(G::ShiftL32, vec![index, scale]);
-
-                    let disp = new.param(Immediate { bits: 32 });
-                    let intermediate = new.action(G::Add32, vec![base, shifted_index]);
-                    new.action_into(out, G::Add32, vec![intermediate, disp]);
-                })
-                .finish()[0]
+    pub mod regs {
+        crate::regs! {
+            pub RAX, RBX, RCX, RDX, RBP, RSI, RDI, RSP, R8, R9, R10, R11, R12, R13, R14, R15,
+            CF, OF, ZF, SF
         }
     }
 
-    regs! {
-        R0, R1, R2
+    pub fn spec() -> MachineSpec<'static, G> {
+        trait InstrBuilderExt {
+            fn memory(&mut self) -> Var;
+            fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
+        }
+
+        trait MachineSpecExt: Sized {
+            fn arith_variants<Op, OS, OU, T>(
+                self,
+                op: Op,
+                overflow_s: OS,
+                overflow_u: OU,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                OS: FnMut(Bits) -> G,
+                OU: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
+        }
+
+        const MEM_OPERAND_SIZE: Bits = 32;
+
+        impl MachineSpecExt for MachineSpec<'static, G> {
+            fn arith_variants<Op, OS, OU, T>(
+                mut self,
+                mut op: Op,
+                mut overflow_s: OS,
+                mut overflow_u: OU,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                OS: FnMut(Bits) -> G,
+                OU: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, mr_name, rm_name) in sizes.as_ref() {
+                    let op = op(size);
+                    let overflow_s = overflow_s(size);
+                    let overflow_u = overflow_u(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(INT_REG);
+
+                            let out = new.arith(op, overflow_s, overflow_u, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(INT_REG);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.arith(op, overflow_s, overflow_u, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.arith(op, overflow_s, overflow_u, left, right);
+                            new.eq(out, left);
+                        });
+                }
+
+                self
+            }
+        }
+
+        impl InstrBuilderExt for InstrBuilder<'_, G> {
+            fn memory(&mut self) -> Var {
+                self.variants::<typenum::consts::U1>()
+                    .or(|[out], new| {
+                        let address = new.param(INT_REG);
+                        new.eq(out, address);
+                    })
+                    .or(|[out], new| {
+                        let base = new.param(INT_REG);
+                        let index = new.param(INT_REG);
+                        new.action_into(out, G::Add(MEM_OPERAND_SIZE), vec![base, index]);
+                    })
+                    .or(|[out], new| {
+                        let base = new.param(INT_REG);
+                        let disp = new.param(Immediate {
+                            bits: MEM_OPERAND_SIZE,
+                        });
+                        new.action_into(out, G::Add(MEM_OPERAND_SIZE), vec![base, disp]);
+                    })
+                    .or(|[out], new| {
+                        let base = new.param(INT_REG);
+                        let index = new.param(INT_REG);
+                        let disp = new.param(Immediate {
+                            bits: MEM_OPERAND_SIZE,
+                        });
+                        let intermediate = new.action(G::Add(MEM_OPERAND_SIZE), vec![base, index]);
+                        new.action_into(out, G::Add(MEM_OPERAND_SIZE), vec![intermediate, disp]);
+                    })
+                    .or(|[out], new| {
+                        let base = new.param(INT_REG);
+
+                        let index = new.param(INT_REG);
+                        let scale = new.param(Immediate { bits: 3 });
+                        let shifted_index =
+                            new.action(G::ShiftL(MEM_OPERAND_SIZE), vec![index, scale]);
+
+                        let disp = new.param(Immediate {
+                            bits: MEM_OPERAND_SIZE,
+                        });
+                        let intermediate =
+                            new.action(G::Add(MEM_OPERAND_SIZE), vec![base, shifted_index]);
+                        new.action_into(out, G::Add(MEM_OPERAND_SIZE), vec![intermediate, disp]);
+                    })
+                    .finish()[0]
+            }
+
+            fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var {
+                let out = self.action(op, [left, right]);
+                self.action_into(&regs::CF, overflow_u, [out]);
+                self.action_into(&regs::OF, overflow_s, [out]);
+                self.action_into(&regs::ZF, G::IsZero, [out]);
+                self.action_into(&regs::SF, G::LtZero, [out]);
+
+                out
+            }
+        }
+
+        // When we define `R0` etc, we should specify its size in bits
+        // We _don't_ specify masks here - registers as defined at this point must be non-overlapping,
+        // with masking and overlapping semantics defined at the level of the instructions.
+        const INT_REG: RegClass = RegClass(&[
+            regs::RAX,
+            regs::RBX,
+            regs::RCX,
+            regs::RDX,
+            regs::RBP,
+            regs::RSI,
+            regs::RDI,
+            regs::RSP,
+            regs::R9,
+            regs::R10,
+            regs::R11,
+            regs::R12,
+            regs::R13,
+            regs::R14,
+            regs::R15,
+        ]);
+
+        MachineSpec::new()
+            .arith_variants(
+                G::Add,
+                G::AddOverflowS,
+                G::AddOverflowU,
+                [
+                    (32, "add r32, r32", "add r32, m32", "add m32, r32"),
+                    (64, "add r64, r64", "add r64, m64", "add m64, r64"),
+                ],
+            )
+            .arith_variants(
+                G::Sub,
+                G::AddOverflowS,
+                G::AddOverflowU,
+                [
+                    (32, "sub r32, r32", "sub r32, m32", "sub m32, r32"),
+                    (64, "sub r64, r64", "sub r64, m64", "sub m64, r64"),
+                ],
+            )
+            .instr("cmp r32, r32", |new| {
+                let left = new.param(INT_REG);
+                let right = new.param(INT_REG);
+
+                let _ = new.arith(
+                    G::Sub(32),
+                    G::SubOverflowS(32),
+                    G::SubOverflowU(32),
+                    left,
+                    right,
+                );
+            })
+            .instr("cmp r32, m32", |new| {
+                let left = new.param(INT_REG);
+                let right_addr = new.memory();
+                let right = new.action(
+                    G::Load {
+                        out: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [right_addr],
+                );
+
+                let _ = new.arith(
+                    G::Sub(32),
+                    G::SubOverflowS(32),
+                    G::SubOverflowU(32),
+                    left,
+                    right,
+                );
+            })
+            .instr("cmp m32, r32", |new| {
+                let left_addr = new.memory();
+                let left = new.action(
+                    G::Load {
+                        out: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [left_addr],
+                );
+                let right = new.param(INT_REG);
+
+                let _ = new.arith(
+                    G::Sub(32),
+                    G::SubOverflowS(32),
+                    G::SubOverflowU(32),
+                    left,
+                    right,
+                );
+            })
     }
-
-    // When we define `R0` etc, we should specify its size in bits
-    // We _don't_ specify masks here - registers as defined at this point must be non-overlapping,
-    // with masking and overlapping semantics defined at the level of the instructions.
-    const INT_REG: RegClass = RegClass(&[R0, R1, R2 /* ..snip.. */]);
-
-    MachineSpec::new()
-        .instr("add r, r", |new| {
-            let left = new.param(INT_REG);
-
-            let right = new.param(INT_REG);
-            let out = new.action(G::Add32, arr![left, right]);
-            new.eq(left, out);
-        })
-        .instr("add m, r", |new| {
-            let left_addr = new.memory();
-            let right = new.param(INT_REG);
-
-            let left = new.action(G::Load, arr![left_addr]);
-            let out = new.action(G::Add32, arr![left, right]);
-            new.action(G::Store, arr![out]);
-        })
-        .instr("add r, m", |new| {
-            let left = new.param(INT_REG);
-            let right_addr = new.memory();
-
-            let right = new.action(G::Load, arr![right_addr]);
-            let out = new.action(G::Add32, arr![left, right]);
-            new.eq(out, left);
-        })
 }
 
 #[cfg(test)]
 mod test {
     #[test]
     fn x64_is_correct() {
-        panic!("{}", crate::make_x64_specification());
+        panic!("{}", crate::x64::spec());
     }
 }
