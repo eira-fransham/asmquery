@@ -424,15 +424,24 @@ pub mod actions {
         Load { out: Bits, mem_size: Bits },
         OverflowSigned,
         OverflowUnsigned,
+        AddWithCarry(Bits),
         Add(Bits),
+        AddWithCarryOverflowS(Bits),
+        AddWithCarryOverflowU(Bits),
         AddOverflowS(Bits),
         AddOverflowU(Bits),
+        AddFp(Bits),
+        And(Bits),
         ShiftL(Bits),
+        SubWithCarry(Bits),
         Sub(Bits),
+        SubWithCarryOverflowS(Bits),
+        SubWithCarryOverflowU(Bits),
         SubOverflowS(Bits),
         SubOverflowU(Bits),
         IsZero,
         LtZero,
+        Clear,
     }
 }
 
@@ -443,7 +452,7 @@ pub mod x64 {
     pub mod regs {
         crate::regs! {
             pub RAX, RBX, RCX, RDX, RBP, RSI, RDI, RSP, R8, R9, R10, R11, R12, R13, R14, R15,
-            CF, OF, ZF, SF
+            CF, OF, ZF, SF, XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7
         }
     }
 
@@ -451,6 +460,7 @@ pub mod x64 {
         trait InstrBuilderExt {
             fn memory(&mut self) -> Var;
             fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
+            fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
         }
 
         trait MachineSpecExt: Sized {
@@ -466,6 +476,20 @@ pub mod x64 {
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
+
+            fn arith_variants_carry<Op, OS, OU, T>(
+                self,
+                op: Op,
+                overflow_s: OS,
+                overflow_u: OU,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                OS: FnMut(Bits) -> G,
+                OU: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
+
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
@@ -537,6 +561,76 @@ pub mod x64 {
 
                 self
             }
+
+            //////////////////////
+
+            fn arith_variants_carry<Op, OS, OU, T>(
+                mut self,
+                mut op: Op,
+                mut overflow_s: OS,
+                mut overflow_u: OU,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                OS: FnMut(Bits) -> G,
+                OU: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, mr_name, rm_name) in sizes.as_ref() {
+                    let op = op(size);
+                    let overflow_s = overflow_s(size);
+                    let overflow_u = overflow_u(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(INT_REG);
+
+                            let out = new.arith_carry(op, overflow_s, overflow_u, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(INT_REG);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.arith_carry(op, overflow_s, overflow_u, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.arith_carry(op, overflow_s, overflow_u, left, right);
+                            new.eq(out, left);
+                        });
+                }
+
+                self
+            }
+
         }
 
         impl InstrBuilderExt for InstrBuilder<'_, G> {
@@ -594,6 +688,18 @@ pub mod x64 {
 
                 out
             }
+
+            fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var {
+                let carry = self.param(&regs::CF);
+                let out = self.action(op, [left, right, carry]);
+                self.action_into(&regs::CF, overflow_u, [out]);
+                self.action_into(&regs::OF, overflow_s, [out]);
+                self.action_into(&regs::ZF, G::IsZero, [out]);
+                self.action_into(&regs::SF, G::LtZero, [out]);
+
+                out
+            }
+
         }
 
         // When we define `R0` etc, we should specify its size in bits
@@ -616,6 +722,16 @@ pub mod x64 {
             regs::R14,
             regs::R15,
         ]);
+        const FP_REG: RegClass = RegClass(&[
+            regs::XMM0,
+            regs::XMM1,
+            regs::XMM2,
+            regs::XMM3,
+            regs::XMM4,
+            regs::XMM5,
+            regs::XMM6,
+            regs::XMM7,
+        ]);
 
         MachineSpec::new()
             .arith_variants(
@@ -627,15 +743,141 @@ pub mod x64 {
                     (64, "add r64, r64", "add r64, m64", "add m64, r64"),
                 ],
             )
+            .instr("add r32, i32", |new| {
+
+                let left = new.param(INT_REG);
+                let right = new.param(Immediate { bits: 32 });
+
+                let out = new.arith(G::Add(32), G::AddOverflowS(32), G::AddOverflowU(32), left, right);
+                new.eq(left, out);
+            })
+            .instr("add m32, i32", |new| {
+                let left_addr = new.memory();
+                let left = new.action(G::Load { out : 32, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+
+                let right = new.param(Immediate { bits: 32 });
+
+                let out = new.arith(G::Add(32), G::AddOverflowS(32), G::AddOverflowU(32), left, right);
+                let _ = new.action(
+                    G::Store {
+                        input: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [out],
+                );
+            })
+            .arith_variants_carry(
+                G::AddWithCarry,
+                G::AddWithCarryOverflowS,
+                G::AddWithCarryOverflowS,
+                [
+                    (32, "adc r32, r32", "adc r32, m32", "adc m32, r32"),
+                    (64, "adc r64, r64", "adc r64, m64", "adc m64, r64"),
+                ],
+            )
+            .instr("addss r32, r32", |new| {
+
+                let left = new.param(FP_REG);
+                let right = new.param(FP_REG);
+
+                let out = new.action(G::AddFp(32), [left, right]);
+                new.eq(left, out);
+            })
+            .instr("addss r32, m32", |new| {
+
+                let left = new.param(FP_REG);
+                let right_addr = new.memory();
+
+                let right = new.action(
+                    G::Load {
+                        out: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [right_addr],
+                );
+
+                let out = new.action(G::AddFp(32), [left, right]);
+                new.eq(left, out);
+            })
+            .instr("addsd r64, r64", |new| {
+
+                let left = new.param(FP_REG);
+                let right = new.param(FP_REG);
+
+                let out = new.action(G::AddFp(64), [left, right]);
+                new.eq(left, out);
+            })
+            .instr("addsd r64, m64", |new| {
+
+                let left = new.param(FP_REG);
+                let right_addr = new.memory();
+
+                let right = new.action(
+                    G::Load {
+                        out: 64,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [right_addr],
+                );
+
+                let out = new.action(G::AddFp(64), [left, right]);
+                new.eq(left, out);
+            })
+            .instr("and r32, r32", |new| {
+
+                let left = new.param(INT_REG);
+                let right = new.param(INT_REG);
+
+                let out = new.action(G::And(32), [left, right]);
+                new.action_into(&regs::CF, G::Clear, []);
+                new.action_into(&regs::OF, G::Clear, []);
+                new.action_into(&regs::ZF, G::IsZero, [out]);
+                new.action_into(&regs::SF, G::LtZero, [out]);
+
+                new.eq(left, out);
+            })
             .arith_variants(
                 G::Sub,
-                G::AddOverflowS,
-                G::AddOverflowU,
+                G::SubOverflowS,
+                G::SubOverflowU,
                 [
                     (32, "sub r32, r32", "sub r32, m32", "sub m32, r32"),
                     (64, "sub r64, r64", "sub r64, m64", "sub m64, r64"),
                 ],
             )
+            .instr("sub r32, i32", |new| {
+
+                let left = new.param(INT_REG);
+                let right = new.param(Immediate { bits: 32 });
+
+                let out = new.arith(G::Sub(32), G::SubOverflowS(32), G::SubOverflowU(32), left, right);
+                new.eq(left, out);
+            })
+            .instr("sub m32, i32", |new| {
+                let left_addr = new.memory();
+                let left = new.action(G::Load { out : 32, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+
+                let right = new.param(Immediate { bits: 32 });
+
+                let out = new.arith(G::Sub(32), G::SubOverflowS(32), G::SubOverflowU(32), left, right);
+                let _ = new.action(
+                    G::Store {
+                        input: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [out],
+                );
+            })
+            .arith_variants_carry(
+                G::SubWithCarry,
+                G::SubWithCarryOverflowS,
+                G::SubWithCarryOverflowU,
+                [
+                    (32, "sbb r32, r32", "sbb r32, m32", "sbb m32, r32"),
+                    (64, "sbb r64, r64", "sbb r64, m64", "sbb m64, r64"),
+                ],
+            )
+
             .instr("cmp r32, r32", |new| {
                 let left = new.param(INT_REG);
                 let right = new.param(INT_REG);
