@@ -424,15 +424,19 @@ pub mod actions {
         Load { out: Bits, mem_size: Bits },
         OverflowSigned,
         OverflowUnsigned,
-        Adc(Bits),
+        AddWithCarry(Bits),
         Add(Bits),
+        AddWithCarryOverflowS(Bits),
+        AddWithCarryOverflowU(Bits),
         AddOverflowS(Bits),
         AddOverflowU(Bits),
         AddFp(Bits),
         And(Bits),
         ShiftL(Bits),
-        Sbb(Bits),
+        SubWithCarry(Bits),
         Sub(Bits),
+        SubWithCarryOverflowS(Bits),
+        SubWithCarryOverflowU(Bits),
         SubOverflowS(Bits),
         SubOverflowU(Bits),
         IsZero,
@@ -739,7 +743,7 @@ pub mod x64 {
                     (64, "add r64, r64", "add r64, m64", "add m64, r64"),
                 ],
             )
-            .instr("add r, i", |new| {
+            .instr("add r32, i32", |new| {
 
                 let left = new.param(INT_REG);
                 let right = new.param(Immediate { bits: 32 });
@@ -747,7 +751,7 @@ pub mod x64 {
                 let out = new.arith(G::Add(32), G::AddOverflowS(32), G::AddOverflowU(32), left, right);
                 new.eq(left, out);
             })
-            .instr("add m, i", |new| {
+            .instr("add m32, i32", |new| {
                 let left_addr = new.memory();
                 let left = new.action(G::Load { out : 32, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
 
@@ -763,15 +767,15 @@ pub mod x64 {
                 );
             })
             .arith_variants_carry(
-                G::Adc,
-                G::AddOverflowS,
-                G::AddOverflowU,
+                G::AddWithCarry,
+                G::AddWithCarryOverflowS,
+                G::AddWithCarryOverflowS,
                 [
                     (32, "adc r32, r32", "adc r32, m32", "adc m32, r32"),
                     (64, "adc r64, r64", "adc r64, m64", "adc m64, r64"),
                 ],
             )
-            .instr("addss r, r", |new| {
+            .instr("addss r32, r32", |new| {
 
                 let left = new.param(FP_REG);
                 let right = new.param(FP_REG);
@@ -779,7 +783,7 @@ pub mod x64 {
                 let out = new.action(G::AddFp(32), [left, right]);
                 new.eq(left, out);
             })
-            .instr("addss r, m", |new| {
+            .instr("addss r32, m32", |new| {
 
                 let left = new.param(FP_REG);
                 let right_addr = new.memory();
@@ -795,7 +799,7 @@ pub mod x64 {
                 let out = new.action(G::AddFp(32), [left, right]);
                 new.eq(left, out);
             })
-            .instr("addsd r, r", |new| {
+            .instr("addsd r64, r64", |new| {
 
                 let left = new.param(FP_REG);
                 let right = new.param(FP_REG);
@@ -803,7 +807,7 @@ pub mod x64 {
                 let out = new.action(G::AddFp(64), [left, right]);
                 new.eq(left, out);
             })
-            .instr("addsd r, m", |new| {
+            .instr("addsd r64, m64", |new| {
 
                 let left = new.param(FP_REG);
                 let right_addr = new.memory();
@@ -819,7 +823,7 @@ pub mod x64 {
                 let out = new.action(G::AddFp(64), [left, right]);
                 new.eq(left, out);
             })
-            .instr("and r, r", |new| {
+            .instr("and r32, r32", |new| {
 
                 let left = new.param(INT_REG);
                 let right = new.param(INT_REG);
@@ -841,7 +845,7 @@ pub mod x64 {
                     (64, "sub r64, r64", "sub r64, m64", "sub m64, r64"),
                 ],
             )
-            .instr("sub r, i", |new| {
+            .instr("sub r32, i32", |new| {
 
                 let left = new.param(INT_REG);
                 let right = new.param(Immediate { bits: 32 });
@@ -849,7 +853,7 @@ pub mod x64 {
                 let out = new.arith(G::Sub(32), G::SubOverflowS(32), G::SubOverflowU(32), left, right);
                 new.eq(left, out);
             })
-            .instr("sub m, i", |new| {
+            .instr("sub m32, i32", |new| {
                 let left_addr = new.memory();
                 let left = new.action(G::Load { out : 32, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
 
@@ -865,9 +869,9 @@ pub mod x64 {
                 );
             })
             .arith_variants_carry(
-                G::Sbb,
-                G::SubOverflowS,
-                G::SubOverflowU,
+                G::SubWithCarry,
+                G::SubWithCarryOverflowS,
+                G::SubWithCarryOverflowU,
                 [
                     (32, "sbb r32, r32", "sbb r32, m32", "sbb m32, r32"),
                     (64, "sbb r64, r64", "sbb r64, m64", "sbb m64, r64"),
