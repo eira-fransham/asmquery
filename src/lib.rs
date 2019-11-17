@@ -432,6 +432,8 @@ pub mod actions {
         AddOverflowU(Bits),
         AddFp(Bits),
         And(Bits),
+        Or(Bits),
+        Xor(Bits),
         ShiftL(Bits),
         SubWithCarry(Bits),
         Sub(Bits),
@@ -461,6 +463,7 @@ pub mod x64 {
             fn memory(&mut self) -> Var;
             fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
             fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
+            fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var;
         }
 
         trait MachineSpecExt: Sized {
@@ -489,7 +492,14 @@ pub mod x64 {
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
-
+            fn arith_variants_logical<Op, T>(
+                self,
+                op: Op,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
@@ -631,6 +641,68 @@ pub mod x64 {
                 self
             }
 
+            ////// arith_
+
+            fn arith_variants_logical<Op, T>(
+                mut self,
+                mut op: Op,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, mr_name, rm_name) in sizes.as_ref() {
+                    let op = op(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(INT_REG);
+
+                            let out = new.arith_logical(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(INT_REG);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.arith_logical(op, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.arith_logical(op, left, right);
+                            new.eq(out, left);
+                        });
+                }
+
+                self
+            }
         }
 
         impl InstrBuilderExt for InstrBuilder<'_, G> {
@@ -694,6 +766,17 @@ pub mod x64 {
                 let out = self.action(op, [left, right, carry]);
                 self.action_into(&regs::CF, overflow_u, [out]);
                 self.action_into(&regs::OF, overflow_s, [out]);
+                self.action_into(&regs::ZF, G::IsZero, [out]);
+                self.action_into(&regs::SF, G::LtZero, [out]);
+
+                out
+            }
+
+            fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var {
+                let out = self.action(op, [left, right]);
+
+                self.action_into(&regs::CF, G::Clear, []);
+                self.action_into(&regs::OF, G::Clear, []);
                 self.action_into(&regs::ZF, G::IsZero, [out]);
                 self.action_into(&regs::SF, G::LtZero, [out]);
 
@@ -823,19 +906,27 @@ pub mod x64 {
                 let out = new.action(G::AddFp(64), [left, right]);
                 new.eq(left, out);
             })
-            .instr("and r32, r32", |new| {
-
-                let left = new.param(INT_REG);
-                let right = new.param(INT_REG);
-
-                let out = new.action(G::And(32), [left, right]);
-                new.action_into(&regs::CF, G::Clear, []);
-                new.action_into(&regs::OF, G::Clear, []);
-                new.action_into(&regs::ZF, G::IsZero, [out]);
-                new.action_into(&regs::SF, G::LtZero, [out]);
-
-                new.eq(left, out);
-            })
+            .arith_variants_logical(
+                G::And,
+                [
+                    (32, "and r32, r32", "and r32, m32", "and m32, r32"),
+                    (64, "and r64, r64", "and r64, m64", "and m64, r64"),
+                ],
+            )
+            .arith_variants_logical(
+                G::Or,
+                [
+                    (32, "or r32, r32", "or r32, m32", "or m32, r32"),
+                    (64, "or r64, r64", "or r64, m64", "or m64, r64"),
+                ],
+            )
+            .arith_variants_logical(
+                G::Xor,
+                [
+                    (32, "xor r32, r32", "xor r32, m32", "xor m32, r32"),
+                    (64, "xor r64, r64", "xor r64, m64", "xor m64, r64"),
+                ],
+            )
             .arith_variants(
                 G::Sub,
                 G::SubOverflowS,
