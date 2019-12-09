@@ -432,15 +432,21 @@ pub mod actions {
         AddOverflowU(Bits),
         AddFp(Bits),
         And(Bits),
+        DivFp(Bits),
+        MaxFp(Bits),
+        MinFp(Bits),
+        MulFp(Bits),
         Or(Bits),
         Xor(Bits),
         ShiftL(Bits),
+        SqrtFp(Bits),
         SubWithCarry(Bits),
         Sub(Bits),
         SubWithCarryOverflowS(Bits),
         SubWithCarryOverflowU(Bits),
         SubOverflowS(Bits),
         SubOverflowU(Bits),
+        SubFp(Bits),
         IsZero,
         LtZero,
         Clear,
@@ -464,6 +470,7 @@ pub mod x64 {
             fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
             fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
             fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var;
+            fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var;
         }
 
         trait MachineSpecExt: Sized {
@@ -500,6 +507,16 @@ pub mod x64 {
             where
                 Op: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
+
+            fn arith_variants_fp<Op, T>(
+                self,
+                op: Op,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str)]>;
+
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
@@ -641,8 +658,6 @@ pub mod x64 {
                 self
             }
 
-            ////// arith_
-
             fn arith_variants_logical<Op, T>(
                 mut self,
                 mut op: Op,
@@ -703,6 +718,47 @@ pub mod x64 {
 
                 self
             }
+
+            fn arith_variants_fp<Op, T>(
+                mut self,
+                mut op: Op,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, rm_name) in sizes.as_ref() {
+                    let op = op(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right = new.param(FP_REG);
+
+                            let out = new.arith_fp(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.arith_fp(op, left, right);
+                            new.eq(out, left);
+                        });
+                }
+
+                self
+            }
+
         }
 
         impl InstrBuilderExt for InstrBuilder<'_, G> {
@@ -783,6 +839,12 @@ pub mod x64 {
                 out
             }
 
+            fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var {
+                let out = self.action(op, [left, right]);
+
+                out
+            }
+
         }
 
         // When we define `R0` etc, we should specify its size in bits
@@ -858,54 +920,11 @@ pub mod x64 {
                     (64, "adc r64, r64", "adc r64, m64", "adc m64, r64"),
                 ],
             )
-            .instr("addss r32, r32", |new| {
-
-                let left = new.param(FP_REG);
-                let right = new.param(FP_REG);
-
-                let out = new.action(G::AddFp(32), [left, right]);
-                new.eq(left, out);
-            })
-            .instr("addss r32, m32", |new| {
-
-                let left = new.param(FP_REG);
-                let right_addr = new.memory();
-
-                let right = new.action(
-                    G::Load {
-                        out: 32,
-                        mem_size: MEM_OPERAND_SIZE,
-                    },
-                    [right_addr],
-                );
-
-                let out = new.action(G::AddFp(32), [left, right]);
-                new.eq(left, out);
-            })
-            .instr("addsd r64, r64", |new| {
-
-                let left = new.param(FP_REG);
-                let right = new.param(FP_REG);
-
-                let out = new.action(G::AddFp(64), [left, right]);
-                new.eq(left, out);
-            })
-            .instr("addsd r64, m64", |new| {
-
-                let left = new.param(FP_REG);
-                let right_addr = new.memory();
-
-                let right = new.action(
-                    G::Load {
-                        out: 64,
-                        mem_size: MEM_OPERAND_SIZE,
-                    },
-                    [right_addr],
-                );
-
-                let out = new.action(G::AddFp(64), [left, right]);
-                new.eq(left, out);
-            })
+            .arith_variants_fp(G::AddFp,
+                               [(32, "addss r32, r32", "addss r32, m32"),
+                                (64, "addsd r64, r64", "addsd r64, m64"),
+                               ]
+            )
             .arith_variants_logical(
                 G::And,
                 [
@@ -913,6 +932,33 @@ pub mod x64 {
                     (64, "and r64, r64", "and r64, m64", "and m64, r64"),
                 ],
             )
+            .arith_variants_fp(G::DivFp,
+                               [(32, "divss r32, r32", "divss r32, m32"),
+                                (64, "divsd r64, r64", "divsd r64, m64"),
+                               ]
+            )
+
+            .arith_variants_fp(G::MaxFp,
+                               [(32, "maxss r32, r32", "maxss r32, m32"),
+                                (64, "maxsd r64, r64", "maxsd r64, m64"),
+                               ]
+            )
+            .arith_variants_fp(G::MinFp,
+                               [(32, "minss r32, r32", "minss r32, m32"),
+                                (64, "minsd r64, r64", "minsd r64, m64"),
+                               ]
+            )
+            .arith_variants_fp(G::MulFp,
+                               [(32, "mulss r32, r32", "mulss r32, m32"),
+                                (64, "mulsd r64, r64", "mulsd r64, m64"),
+                               ]
+            )
+            .arith_variants_fp(G::SqrtFp,
+                               [(32, "sqrtss r32, r32", "sqrtss r32, m32"),
+                                (64, "sqrtsd r64, r64", "sqrtsd r64, m64"),
+                               ]
+            )
+
             .arith_variants_logical(
                 G::Or,
                 [
@@ -967,6 +1013,11 @@ pub mod x64 {
                     (32, "sbb r32, r32", "sbb r32, m32", "sbb m32, r32"),
                     (64, "sbb r64, r64", "sbb r64, m64", "sbb m64, r64"),
                 ],
+            )
+            .arith_variants_fp(G::SubFp,
+                               [(32, "subss r32, r32", "subss r32, m32"),
+                                (64, "subsd r64, r64", "subsd r64, m64"),
+                               ]
             )
 
             .instr("cmp r32, r32", |new| {
