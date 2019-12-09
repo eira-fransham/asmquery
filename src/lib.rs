@@ -432,12 +432,15 @@ pub mod actions {
         AddOverflowU(Bits),
         AddFp(Bits),
         And(Bits),
+        PackedAnd(Bits),
         DivFp(Bits),
         MaxFp(Bits),
         MinFp(Bits),
         MulFp(Bits),
         Or(Bits),
+        PackedOr(Bits),
         Xor(Bits),
+        PackedXor(Bits),
         ShiftL(Bits),
         SqrtFp(Bits),
         SubWithCarry(Bits),
@@ -971,6 +974,21 @@ pub mod x64 {
                     (32, "and r32, r32", "and r32, m32", "and m32, r32", "and r32, i32", "and m32, i32"),
                     (64, "and r64, r64", "and r64, m64", "and m64, r64", "and r64, i32", "and m64, i32"),
                 ],
+            )
+            .arith_variants_fp(G::PackedAnd,
+                               [(32, "andps r128, r128", "andps r128, m128"),
+                                (64, "andpd r128, r128", "andpd r128, m128"),
+                               ]
+            )
+            .arith_variants_fp(G::PackedOr,
+                               [(32, "orps r128, r128", "orps r128, m128"),
+                                (64, "orpd r128, r128", "orpd r128, m128"),
+                               ]
+            )
+            .arith_variants_fp(G::PackedXor,
+                               [(32, "xorps r128, r128", "xorps r128, m128"),
+                                (64, "xorpd r128, r128", "xorpd r128, m128"),
+                               ]
             )
             .arith_variants_fp(G::DivFp,
                                [(32, "divss r32, r32", "divss r32, m32"),
