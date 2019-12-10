@@ -432,6 +432,18 @@ pub mod actions {
         AddOverflowU(Bits),
         AddFp(Bits),
         And(Bits),
+        Asl(Bits),                    // Arithmetic shift left
+        AslOverflow(Bits),            // Overflag flag as a result of arithmetic shift left
+        AslCarry(Bits),               // Carry flag as a result of arithmetic shift left
+        Asr(Bits),                    // Arithmetic shift right
+        AsrOverflow(Bits),            // Overflag flag as a result of arithmetic shift right
+        AsrCarry(Bits),               // Carry flag as a result of arithmetic shift right
+        Lsl(Bits),                    // Logical shift left
+        LslOverflow(Bits),            // Overflag flag as a result of logical shift left
+        LslCarry(Bits),               // Carry flag as a result of logical shift left
+        Lsr(Bits),                    // Logical shift right
+        LsrOverflow(Bits),            // Overflag flag as a result of logical shift right
+        LsrCarry(Bits),               // Carry flag as a result of logical shift right
         DivFp(Bits),
         MaxFp(Bits),
         MinFp(Bits),
@@ -516,6 +528,20 @@ pub mod x64 {
             where
                 Op: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str)]>;
+
+            fn arith_variants_shift<Op, Ovf, Cf, T>(
+                self,
+                op: Op,
+                overflow: Ovf,
+                carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>;
+
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
@@ -822,6 +848,78 @@ pub mod x64 {
                 self
             }
 
+            fn arith_variants_shift<Op, Ovf, Cf, T>(
+                mut  self,
+                mut  op: Op,
+                mut overflow: Ovf,
+                mut carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name,  mr_name, ri_name, mi_name) in sizes.as_ref() {
+                    let op = op(size);
+                    let shift_overflow = overflow(size);
+                    let shift_carry = carry(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(&regs::RCX);
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(&regs::RCX);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(ri_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(Immediate { bits: 8 });
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mi_name, |new| {
+                            let left_addr = new.memory();
+                            let left = new.action(G::Load { out : size, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+
+                            let right = new.param(Immediate { bits: 8 });
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        });
+                    }
+                self
+            }
         }
 
         impl InstrBuilderExt for InstrBuilder<'_, G> {
@@ -1034,6 +1132,39 @@ pub mod x64 {
             .arith_variants_fp(G::SubFp,
                                [(32, "subss r32, r32", "subss r32, m32"),
                                 (64, "subsd r64, r64", "subsd r64, m64"),
+                               ]
+            )
+            .arith_variants_shift(
+                G::Asl,
+                G::AslOverflow,
+                G::AslCarry,
+                               [(32, "sal r32, cl", "sal m32, cl", "sal r32, i8", "sal m32, i8"),
+                                (64, "sal r64, cl", "sal m64, cl", "sal r64, i8", "sal m64, i8"),
+                               ]
+            )
+            .arith_variants_shift(
+                G::Asr,
+                G::AsrOverflow,
+                G::AsrCarry,
+                               [(32, "sar r32, cl", "sar m32, cl", "sar r32, i8", "sar m32, i8"),
+                                (64, "sar r64, cl", "sar m64, cl", "sar r64, i8", "sar m64, i8"),
+                               ]
+            )
+
+            .arith_variants_shift(
+                G::Lsl,
+                G::LslOverflow,
+                G::LslCarry,
+                               [(32, "shl r32, cl", "shl m32, cl", "shl r32, i8", "shl m32, i8"),
+                                (64, "shl r64, cl", "shl m64, cl", "shl r64, i8", "shl m64, i8"),
+                               ]
+            )
+            .arith_variants_shift(
+                G::Lsr,
+                G::LsrOverflow,
+                G::LsrCarry,
+                               [(32, "shr r32, cl", "shr m32, cl", "shr r32, i8", "shr m32, i8"),
+                                (64, "shr r64, cl", "shr m64, cl", "shr r64, i8", "shr m64, i8"),
                                ]
             )
 
