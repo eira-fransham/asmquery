@@ -433,6 +433,11 @@ pub mod actions {
         AddFp(Bits),
         And(Bits),
         PackedAnd(Bits),
+        ShiftLOverflow(Bits),
+        ShiftArithR(Bits), // Arithmetic shift right
+        ShiftArithRUnderflowS(Bits),
+        ShiftLogicalR(Bits), // Logical shift right
+        ShiftLogicalRUnderflowU(Bits),
         DivFp(Bits),
         MaxFp(Bits),
         MinFp(Bits),
@@ -453,6 +458,7 @@ pub mod actions {
         IsZero,
         LtZero,
         Clear,
+        Undefined(Bits),
     }
 }
 
@@ -471,7 +477,14 @@ pub mod x64 {
         trait InstrBuilderExt {
             fn memory(&mut self) -> Var;
             fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
-            fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var;
+            fn arith_carry(
+                &mut self,
+                op: G,
+                overflow_s: G,
+                overflow_u: G,
+                left: Var,
+                right: Var,
+            ) -> Var;
             fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var;
             fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var;
         }
@@ -488,7 +501,16 @@ pub mod x64 {
                 Op: FnMut(Bits) -> G,
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>;
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >;
 
             fn arith_variants_carry<Op, OS, OU, T>(
                 self,
@@ -501,24 +523,47 @@ pub mod x64 {
                 Op: FnMut(Bits) -> G,
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>;
-            fn arith_variants_logical<Op, T>(
-                self,
-                op: Op,
-                sizes: T,
-            ) -> Self
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >;
+            fn arith_variants_logical<Op, T>(self, op: Op, sizes: T) -> Self
             where
                 Op: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>;
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >;
 
-            fn arith_variants_fp<Op, T>(
-                self,
-                op: Op,
-                sizes: T,
-            ) -> Self
+            fn arith_variants_fp<Op, T>(self, op: Op, sizes: T) -> Self
             where
                 Op: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str)]>;
+
+            fn arith_variants_shift<Op, Ovf, Cf, T>(
+                self,
+                op: Op,
+                overflow: Ovf,
+                carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>;
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
@@ -535,9 +580,18 @@ pub mod x64 {
                 Op: FnMut(Bits) -> G,
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>,
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >,
             {
-                for &(size, rr_name,  rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
+                for &(size, rr_name, rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
                     let op = op(size);
                     let overflow_s = overflow_s(size);
                     let overflow_u = overflow_u(size);
@@ -595,7 +649,13 @@ pub mod x64 {
                         })
                         .instr(mi_name, |new| {
                             let left_addr = new.memory();
-                            let left = new.action(G::Load { out : size, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
 
                             let right = new.param(Immediate { bits: 32 });
                             let out = new.arith(op, overflow_s, overflow_u, left, right);
@@ -624,9 +684,18 @@ pub mod x64 {
                 Op: FnMut(Bits) -> G,
                 OS: FnMut(Bits) -> G,
                 OU: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>,
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >,
             {
-                for &(size, rr_name,  rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
+                for &(size, rr_name, rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
                     let op = op(size);
                     let overflow_s = overflow_s(size);
                     let overflow_u = overflow_u(size);
@@ -684,7 +753,13 @@ pub mod x64 {
                         })
                         .instr(mi_name, |new| {
                             let left_addr = new.memory();
-                            let left = new.action(G::Load { out : size, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
 
                             let right = new.param(Immediate { bits: 32 });
                             let out = new.arith_carry(op, overflow_s, overflow_u, left, right);
@@ -702,16 +777,21 @@ pub mod x64 {
                 self
             }
 
-            fn arith_variants_logical<Op, T>(
-                mut self,
-                mut op: Op,
-                sizes: T,
-            ) -> Self
+            fn arith_variants_logical<Op, T>(mut self, mut op: Op, sizes: T) -> Self
             where
                 Op: FnMut(Bits) -> G,
-                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str, &'static str)]>,
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >,
             {
-                for &(size, rr_name,  rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
+                for &(size, rr_name, rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
                     let op = op(size);
 
                     self = self
@@ -767,7 +847,13 @@ pub mod x64 {
                         })
                         .instr(mi_name, |new| {
                             let left_addr = new.memory();
-                            let left = new.action(G::Load { out : size, mem_size: MEM_OPERAND_SIZE }, [left_addr]);
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
 
                             let right = new.param(Immediate { bits: 32 });
                             let out = new.arith_logical(op, left, right);
@@ -785,11 +871,7 @@ pub mod x64 {
                 self
             }
 
-            fn arith_variants_fp<Op, T>(
-                mut self,
-                mut op: Op,
-                sizes: T,
-            ) -> Self
+            fn arith_variants_fp<Op, T>(mut self, mut op: Op, sizes: T) -> Self
             where
                 Op: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str)]>,
@@ -825,6 +907,84 @@ pub mod x64 {
                 self
             }
 
+            fn arith_variants_shift<Op, Ovf, Cf, T>(
+                mut self,
+                mut op: Op,
+                mut overflow: Ovf,
+                mut carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
+                    let op = op(size);
+                    let shift_overflow = overflow(size);
+                    let shift_carry = carry(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(&regs::RCX);
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(&regs::RCX);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(ri_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(Immediate { bits: 8 });
+
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mi_name, |new| {
+                            let left_addr = new.memory();
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let right = new.param(Immediate { bits: 8 });
+                            let out = new.arith(op, shift_overflow, shift_carry, left, right);
+
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        });
+                }
+                self
+            }
         }
 
         impl InstrBuilderExt for InstrBuilder<'_, G> {
@@ -883,7 +1043,14 @@ pub mod x64 {
                 out
             }
 
-            fn arith_carry(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var {
+            fn arith_carry(
+                &mut self,
+                op: G,
+                overflow_s: G,
+                overflow_u: G,
+                left: Var,
+                right: Var,
+            ) -> Var {
                 let carry = self.param(&regs::CF);
                 let out = self.action(op, [left, right, carry]);
                 self.action_into(&regs::CF, overflow_u, [out]);
@@ -910,7 +1077,6 @@ pub mod x64 {
 
                 out
             }
-
         }
 
         // When we define `R0` etc, we should specify its size in bits
@@ -950,8 +1116,22 @@ pub mod x64 {
                 G::AddOverflowS,
                 G::AddOverflowU,
                 [
-                    (32, "add r32, r32", "add r32, m32", "add m32, r32", "add r32, i32", "add m32, i32"),
-                    (64, "add r64, r64", "add r64, m64", "add m64, r64", "add r64, i32", "add m64, i32"),
+                    (
+                        32,
+                        "add r32, r32",
+                        "add r32, m32",
+                        "add m32, r32",
+                        "add r32, i32",
+                        "add m32, i32",
+                    ),
+                    (
+                        64,
+                        "add r64, r64",
+                        "add r64, m64",
+                        "add m64, r64",
+                        "add r64, i32",
+                        "add m64, i32",
+                    ),
                 ],
             )
             .arith_variants_carry(
@@ -959,76 +1139,148 @@ pub mod x64 {
                 G::AddWithCarryOverflowS,
                 G::AddWithCarryOverflowU,
                 [
-                    (32, "adc r32, r32", "adc r32, m32", "adc m32, r32", "adc r32, i32", "adc m32, i32"),
-                    (64, "adc r64, r64", "adc r64, m64", "adc m64, r64", "adc r64, i32", "adc m64, i32"),
+                    (
+                        32,
+                        "adc r32, r32",
+                        "adc r32, m32",
+                        "adc m32, r32",
+                        "adc r32, i32",
+                        "adc m32, i32",
+                    ),
+                    (
+                        64,
+                        "adc r64, r64",
+                        "adc r64, m64",
+                        "adc m64, r64",
+                        "adc r64, i32",
+                        "adc m64, i32",
+                    ),
                 ],
             )
-            .arith_variants_fp(G::AddFp,
-                               [(32, "addss r32, r32", "addss r32, m32"),
-                                (64, "addsd r64, r64", "addsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::AddFp,
+                [
+                    (32, "addss r32, r32", "addss r32, m32"),
+                    (64, "addsd r64, r64", "addsd r64, m64"),
+                ],
             )
             .arith_variants_logical(
                 G::And,
                 [
-                    (32, "and r32, r32", "and r32, m32", "and m32, r32", "and r32, i32", "and m32, i32"),
-                    (64, "and r64, r64", "and r64, m64", "and m64, r64", "and r64, i32", "and m64, i32"),
+                    (
+                        32,
+                        "and r32, r32",
+                        "and r32, m32",
+                        "and m32, r32",
+                        "and r32, i32",
+                        "and m32, i32",
+                    ),
+                    (
+                        64,
+                        "and r64, r64",
+                        "and r64, m64",
+                        "and m64, r64",
+                        "and r64, i32",
+                        "and m64, i32",
+                    ),
                 ],
             )
-            .arith_variants_fp(G::PackedAnd,
-                               [(32, "andps r128, r128", "andps r128, m128"),
-                                (64, "andpd r128, r128", "andpd r128, m128"),
-                               ]
+            .arith_variants_fp(
+                G::PackedAnd,
+                [
+                    (32, "andps r128, r128", "andps r128, m128"),
+                    (64, "andpd r128, r128", "andpd r128, m128"),
+                ],
             )
-            .arith_variants_fp(G::PackedOr,
-                               [(32, "orps r128, r128", "orps r128, m128"),
-                                (64, "orpd r128, r128", "orpd r128, m128"),
-                               ]
+            .arith_variants_fp(
+                G::PackedOr,
+                [
+                    (32, "orps r128, r128", "orps r128, m128"),
+                    (64, "orpd r128, r128", "orpd r128, m128"),
+                ],
             )
-            .arith_variants_fp(G::PackedXor,
-                               [(32, "xorps r128, r128", "xorps r128, m128"),
-                                (64, "xorpd r128, r128", "xorpd r128, m128"),
-                               ]
+            .arith_variants_fp(
+                G::PackedXor,
+                [
+                    (32, "xorps r128, r128", "xorps r128, m128"),
+                    (64, "xorpd r128, r128", "xorpd r128, m128"),
+                ],
             )
-            .arith_variants_fp(G::DivFp,
-                               [(32, "divss r32, r32", "divss r32, m32"),
-                                (64, "divsd r64, r64", "divsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::DivFp,
+                [
+                    (32, "divss r32, r32", "divss r32, m32"),
+                    (64, "divsd r64, r64", "divsd r64, m64"),
+                ],
             )
-
-            .arith_variants_fp(G::MaxFp,
-                               [(32, "maxss r32, r32", "maxss r32, m32"),
-                                (64, "maxsd r64, r64", "maxsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::MaxFp,
+                [
+                    (32, "maxss r32, r32", "maxss r32, m32"),
+                    (64, "maxsd r64, r64", "maxsd r64, m64"),
+                ],
             )
-            .arith_variants_fp(G::MinFp,
-                               [(32, "minss r32, r32", "minss r32, m32"),
-                                (64, "minsd r64, r64", "minsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::MinFp,
+                [
+                    (32, "minss r32, r32", "minss r32, m32"),
+                    (64, "minsd r64, r64", "minsd r64, m64"),
+                ],
             )
-            .arith_variants_fp(G::MulFp,
-                               [(32, "mulss r32, r32", "mulss r32, m32"),
-                                (64, "mulsd r64, r64", "mulsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::MulFp,
+                [
+                    (32, "mulss r32, r32", "mulss r32, m32"),
+                    (64, "mulsd r64, r64", "mulsd r64, m64"),
+                ],
             )
-            .arith_variants_fp(G::SqrtFp,
-                               [(32, "sqrtss r32, r32", "sqrtss r32, m32"),
-                                (64, "sqrtsd r64, r64", "sqrtsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::SqrtFp,
+                [
+                    (32, "sqrtss r32, r32", "sqrtss r32, m32"),
+                    (64, "sqrtsd r64, r64", "sqrtsd r64, m64"),
+                ],
             )
-
             .arith_variants_logical(
                 G::Or,
                 [
-                    (32, "or r32, r32", "or r32, m32", "or m32, r32", "or r32, i32", "or m32, i32"),
-                    (64, "or r64, r64", "or r64, m64", "or m64, r64", "or r64, i32", "or m64, i32"),
+                    (
+                        32,
+                        "or r32, r32",
+                        "or r32, m32",
+                        "or m32, r32",
+                        "or r32, i32",
+                        "or m32, i32",
+                    ),
+                    (
+                        64,
+                        "or r64, r64",
+                        "or r64, m64",
+                        "or m64, r64",
+                        "or r64, i32",
+                        "or m64, i32",
+                    ),
                 ],
             )
             .arith_variants_logical(
                 G::Xor,
                 [
-                    (32, "xor r32, r32", "xor r32, m32", "xor m32, r32", "xor r32, i32", "xor m32, i32"),
-                    (64, "xor r64, r64", "xor r64, m64", "xor m64, r64", "xor r64, i32", "xor m64, i32"),
+                    (
+                        32,
+                        "xor r32, r32",
+                        "xor r32, m32",
+                        "xor m32, r32",
+                        "xor r32, i32",
+                        "xor m32, i32",
+                    ),
+                    (
+                        64,
+                        "xor r64, r64",
+                        "xor r64, m64",
+                        "xor m64, r64",
+                        "xor r64, i32",
+                        "xor m64, i32",
+                    ),
                 ],
             )
             .arith_variants(
@@ -1036,8 +1288,22 @@ pub mod x64 {
                 G::SubOverflowS,
                 G::SubOverflowU,
                 [
-                    (32, "sub r32, r32", "sub r32, m32", "sub m32, r32", "sub r32, i32", "sub m32, i32"),
-                    (64, "sub r64, r64", "sub r64, m64", "sub m64, r64", "sub r64, i32", "sub m64, i32"),
+                    (
+                        32,
+                        "sub r32, r32",
+                        "sub r32, m32",
+                        "sub m32, r32",
+                        "sub r32, i32",
+                        "sub m32, i32",
+                    ),
+                    (
+                        64,
+                        "sub r64, r64",
+                        "sub r64, m64",
+                        "sub m64, r64",
+                        "sub r64, i32",
+                        "sub m64, i32",
+                    ),
                 ],
             )
             .arith_variants_carry(
@@ -1045,16 +1311,94 @@ pub mod x64 {
                 G::SubWithCarryOverflowS,
                 G::SubWithCarryOverflowU,
                 [
-                    (32, "sbb r32, r32", "sbb r32, m32", "sbb m32, r32", "sbb r32, i32", "sbb m32, i32"),
-                    (64, "sbb r64, r64", "sbb r64, m64", "sbb m64, r64", "sbb r64, i32", "sbb m64, i32"),
+                    (
+                        32,
+                        "sbb r32, r32",
+                        "sbb r32, m32",
+                        "sbb m32, r32",
+                        "sbb r32, i32",
+                        "sbb m32, i32",
+                    ),
+                    (
+                        64,
+                        "sbb r64, r64",
+                        "sbb r64, m64",
+                        "sbb m64, r64",
+                        "sbb r64, i32",
+                        "sbb m64, i32",
+                    ),
                 ],
             )
-            .arith_variants_fp(G::SubFp,
-                               [(32, "subss r32, r32", "subss r32, m32"),
-                                (64, "subsd r64, r64", "subsd r64, m64"),
-                               ]
+            .arith_variants_fp(
+                G::SubFp,
+                [
+                    (32, "subss r32, r32", "subss r32, m32"),
+                    (64, "subsd r64, r64", "subsd r64, m64"),
+                ],
             )
-
+            .arith_variants_shift(
+                G::ShiftArithR,
+                G::Undefined,
+                G::ShiftArithRUnderflowS,
+                [
+                    (
+                        32,
+                        "sar r32, cl",
+                        "sar m32, cl",
+                        "sar r32, i8",
+                        "sar m32, i8",
+                    ),
+                    (
+                        64,
+                        "sar r64, cl",
+                        "sar m64, cl",
+                        "sar r64, i8",
+                        "sar m64, i8",
+                    ),
+                ],
+            )
+            .arith_variants_shift(
+                G::ShiftL,
+                G::Undefined,
+                G::ShiftLOverflow,
+                [
+                    (
+                        32,
+                        "shl r32, cl",
+                        "shl m32, cl",
+                        "shl r32, i8",
+                        "shl m32, i8",
+                    ),
+                    (
+                        64,
+                        "shl r64, cl",
+                        "shl m64, cl",
+                        "shl r64, i8",
+                        "shl m64, i8",
+                    ),
+                ],
+            )
+            .arith_variants_shift(
+                G::ShiftLogicalR,
+                G::Undefined,
+                G::ShiftLogicalRUnderflowU,
+                [
+                    (
+                        32,
+                        "shr r32, cl",
+                        "shr m32, cl",
+                        "shr r32, i8",
+                        "shr m32, i8",
+                    ),
+                    (
+                        64,
+                        "shr r64, cl",
+                        "shr m64, cl",
+                        "shr r64, i8",
+                        "shr m64, i8",
+                    ),
+                ],
+            )
             .instr("cmp r32, r32", |new| {
                 let left = new.param(INT_REG);
                 let right = new.param(INT_REG);
