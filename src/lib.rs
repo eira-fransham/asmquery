@@ -433,8 +433,7 @@ pub mod actions {
         AddFp(Bits),
         And(Bits),
         PackedAnd(Bits),
-        ShiftLeft(Bits), // Shift left
-        ShiftLeftOverflow(Bits),
+        ShiftLOverflow(Bits),
         ShiftArithR(Bits), // Arithmetic shift right
         ShiftArithRUnderflowS(Bits),
         ShiftLogicalR(Bits), // Logical shift right
@@ -1359,9 +1358,9 @@ pub mod x64 {
                 ],
             )
             .arith_variants_shift(
-                G::ShiftLeft,
+                G::ShiftL,
                 G::Undefined,
-                G::ShiftLeftOverflow,
+                G::ShiftLOverflow,
                 [
                     (
                         32,
