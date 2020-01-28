@@ -455,6 +455,8 @@ pub mod actions {
         SubOverflowS(Bits),
         SubOverflowU(Bits),
         SubFp(Bits),
+        Move(Bits),
+        PackedMove(Bits),
         IsZero,
         LtZero,
         Clear,
@@ -487,6 +489,7 @@ pub mod x64 {
             ) -> Var;
             fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var;
             fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var;
+            fn move_action(&mut self, op: G, left: Var, right: Var) -> Var;
         }
 
         trait MachineSpecExt: Sized {
@@ -564,11 +567,138 @@ pub mod x64 {
                 Ovf: FnMut(Bits) -> G,
                 Cf: FnMut(Bits) -> G,
                 T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>;
+
+            fn move_transfer_variants<Op, T>(self, op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>;
+
+            fn move_packed_variants<Op, T>(self, op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>;
+
+            fn move_variants<Op, T>(self, op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >;
         }
 
         const MEM_OPERAND_SIZE: Bits = 32;
 
         impl MachineSpecExt for MachineSpec<'static, G> {
+            fn move_variants<Op, T>(mut self, mut op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<
+                    [(
+                        Bits,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                        &'static str,
+                    )],
+                >,
+            {
+                for &(size, rr_name, rm_name, mr_name, ri_name, mi_name) in sizes.as_ref() {
+                    let op = op(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(INT_REG);
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(out, left);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(INT_REG);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        })
+                        .instr(ri_name, |new| {
+                            let left = new.param(INT_REG);
+
+                            let right = match size {
+                                8 | 16 | 32 => new.param(Immediate { bits: size }),
+                                64 => new.param(Immediate { bits: 32 }),
+                                _ => panic!("move_variants: Bad immediate size"),
+                            };
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mi_name, |new| {
+                            let left_addr = new.memory();
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let right = match size {
+                                8 | 16 | 32 => new.param(Immediate { bits: size }),
+                                64 => new.param(Immediate { bits: 32 }),
+                                _ => panic!("move_variants: Bad immediate size"),
+                            };
+
+                            let out = new.move_action(op, left, right);
+
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        });
+                }
+
+                self
+            }
+
             fn arith_variants<Op, OS, OU, T>(
                 mut self,
                 mut op: Op,
@@ -907,6 +1037,121 @@ pub mod x64 {
                 self
             }
 
+            fn move_packed_variants<Op, T>(mut self, mut op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, rm_name, mr_name) in sizes.as_ref() {
+                    let op = op(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right = new.param(FP_REG);
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(out, left);
+                        })
+                        .instr(mr_name, |new| {
+                            let left_addr = new.memory();
+                            let right = new.param(FP_REG);
+
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            let _ = new.action(
+                                G::Store {
+                                    input: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [out],
+                            );
+                        });
+                }
+
+                self
+            }
+
+            fn move_transfer_variants<Op, T>(mut self, mut op: Op, sizes: T) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, mm_r_name, mm_mem_name, r_mm_name, mem_mm_name) in sizes.as_ref() {
+                    let op = op(size);
+
+                    self = self
+                        .instr(mm_r_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right = new.param(INT_REG);
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mm_mem_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(out, left);
+                        })
+                        .instr(r_mm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(FP_REG);
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(mem_mm_name, |new| {
+                            let left = new.param(FP_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out = new.move_action(op, left, right);
+                            new.eq(left, out);
+                        });
+                }
+
+                self
+            }
+
             fn arith_variants_shift<Op, Ovf, Cf, T>(
                 mut self,
                 mut op: Op,
@@ -1073,6 +1318,12 @@ pub mod x64 {
             }
 
             fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var {
+                let out = self.action(op, [left, right]);
+
+                out
+            }
+
+            fn move_action(&mut self, op: G, left: Var, right: Var) -> Var {
                 let out = self.action(op, [left, right]);
 
                 out
@@ -1396,6 +1647,79 @@ pub mod x64 {
                         "shr m64, cl",
                         "shr r64, i8",
                         "shr m64, i8",
+                    ),
+                ],
+            )
+            .move_variants(
+                G::Move,
+                [
+                    (
+                        8,
+                        "mov r8, r8",
+                        "mov r8, m8",
+                        "mov m8, r8",
+                        "mov r8, i8",
+                        "mov m8, i8",
+                    ),
+                    (
+                        16,
+                        "mov r16, r16",
+                        "mov r16, m16",
+                        "mov m16, r16",
+                        "mov r16, i16",
+                        "mov m16, i16",
+                    ),
+                    (
+                        32,
+                        "mov r32, r32",
+                        "mov r32, m32",
+                        "mov m32, r32",
+                        "mov r32, i32",
+                        "mov m32, i32",
+                    ),
+                    (
+                        64,
+                        "mov r64, r64",
+                        "mov r64, m64",
+                        "mov m64, r64",
+                        "mov r64, i32",
+                        "mov m64, i32",
+                    ),
+                ],
+            )
+            .move_transfer_variants(
+                G::Move,
+                [
+                    (
+                        32,
+                        "movd f32, r32",
+                        "movd f32, m32",
+                        "movd r32, f32",
+                        "movd m32, f32",
+                    ),
+                    (
+                        64,
+                        "movq f64, r64",
+                        "movq f64, m64",
+                        "movq r64, f64",
+                        "movq m64, f64",
+                    ),
+                ],
+            )
+            .move_packed_variants(
+                G::PackedMove,
+                [
+                    (
+                        32,
+                        "movaps f128, f128",
+                        "movaps f128, m128",
+                        "movaps m128, f128",
+                    ),
+                    (
+                        64,
+                        "movapd f128, f128",
+                        "movapd f128, m128",
+                        "movapd m128, f128",
                     ),
                 ],
             )
