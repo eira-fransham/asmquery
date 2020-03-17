@@ -456,7 +456,6 @@ pub mod actions {
         SubOverflowU(Bits),
         SubFp(Bits),
         Move(Bits),
-        PackedMove(Bits),
         IsZero,
         LtZero,
         Clear,
@@ -1707,7 +1706,7 @@ pub mod x64 {
                 ],
             )
             .move_packed_variants(
-                G::PackedMove,
+                G::Move,
                 [
                     (
                         32,
