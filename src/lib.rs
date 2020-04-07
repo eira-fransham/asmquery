@@ -442,6 +442,8 @@ pub mod actions {
         MaxFp(Bits),
         MinFp(Bits),
         MulFp(Bits),
+        SMul(Bits),
+        UMul(Bits),
         Or(Bits),
         PackedOr(Bits),
         Xor(Bits),
@@ -457,8 +459,10 @@ pub mod actions {
         SubFp(Bits),
         Move(Bits),
         IsZero,
+        IsNonZero,
         LtZero,
         Clear,
+        MulTrunc(Bits), // Result of multiply truncated
         Undefined(Bits),
     }
 }
@@ -489,6 +493,24 @@ pub mod x64 {
             fn arith_logical(&mut self, op: G, left: Var, right: Var) -> Var;
             fn arith_fp(&mut self, op: G, left: Var, right: Var) -> Var;
             fn move_action(&mut self, op: G, left: Var, right: Var) -> Var;
+            fn integer_smul(
+                &mut self,
+                op: G,
+                size: u8,
+                cf_action: G,
+                of_action: G,
+                left: Var,
+                right: Var,
+            ) -> Var;
+            fn integer_umul(
+                &mut self,
+                op: G,
+                size: u8,
+                cf_action: G,
+                of_action: G,
+                left: Var,
+                right: Var,
+            ) -> Var;
         }
 
         trait MachineSpecExt: Sized {
@@ -555,6 +577,19 @@ pub mod x64 {
                 T: AsRef<[(Bits, &'static str, &'static str)]>;
 
             fn arith_variants_shift<Op, Ovf, Cf, T>(
+                self,
+                op: Op,
+                overflow: Ovf,
+                carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>;
+
+            fn signed_multiply_variants<Op, Ovf, Cf, T>(
                 self,
                 op: Op,
                 overflow: Ovf,
@@ -1151,6 +1186,79 @@ pub mod x64 {
                 self
             }
 
+            fn signed_multiply_variants<Op, Ovf, Cf, T>(
+                mut self,
+                mut op: Op,
+                mut overflow: Ovf,
+                mut carry: Cf,
+                sizes: T,
+            ) -> Self
+            where
+                Op: FnMut(Bits) -> G,
+                Ovf: FnMut(Bits) -> G,
+                Cf: FnMut(Bits) -> G,
+                T: AsRef<[(Bits, &'static str, &'static str, &'static str, &'static str)]>,
+            {
+                for &(size, rr_name, rm_name, ri_name, mi_name) in sizes.as_ref() {
+                    let op = op(size);
+                    let smul_overflow = overflow(size);
+                    let smul_carry = carry(size);
+
+                    self = self
+                        .instr(rr_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(INT_REG);
+
+                            let out =
+                                new.integer_smul(op, size, smul_overflow, smul_carry, left, right);
+                            new.eq(left, out);
+                        })
+                        .instr(rm_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right_addr = new.memory();
+
+                            let right = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [right_addr],
+                            );
+
+                            let out =
+                                new.integer_smul(op, size, smul_overflow, smul_carry, left, right);
+                            new.eq(out, left);
+                        })
+                        .instr(ri_name, |new| {
+                            let left = new.param(INT_REG);
+                            let right = new.param(Immediate { bits: 32 });
+
+                            // Note in this form (imul rn, rn, imm32 the destination
+                            // register does not have to equal the first source operand
+                            let _out =
+                                new.integer_smul(op, size, smul_overflow, smul_carry, left, right);
+                        })
+                        .instr(mi_name, |new| {
+                            let left_addr = new.memory();
+                            let left = new.action(
+                                G::Load {
+                                    out: size,
+                                    mem_size: MEM_OPERAND_SIZE,
+                                },
+                                [left_addr],
+                            );
+
+                            // Note in this form (imul rn, mn, imm32 the destination
+                            // register does not have to equal the first source operand
+
+                            let right = new.param(Immediate { bits: 32 });
+                            let _out =
+                                new.integer_smul(op, size, smul_overflow, smul_carry, left, right);
+                        });
+                }
+                self
+            }
+
             fn arith_variants_shift<Op, Ovf, Cf, T>(
                 mut self,
                 mut op: Op,
@@ -1275,6 +1383,46 @@ pub mod x64 {
                         new.action_into(out, G::Add(MEM_OPERAND_SIZE), vec![intermediate, disp]);
                     })
                     .finish()[0]
+            }
+
+            fn integer_smul(
+                &mut self,
+                op: G,
+                size: u8,
+                cf_action: G,
+                of_action: G,
+                left: Var,
+                right: Var,
+            ) -> Var {
+                let out = self.action(op, [left, right]);
+                self.action_into(&regs::CF, cf_action, [out]);
+                self.action_into(&regs::OF, of_action, [out]);
+                self.action_into(&regs::ZF, G::Undefined(size), [out]);
+                self.action_into(&regs::SF, G::Undefined(size), [out]);
+
+                out
+            }
+
+            fn integer_umul(
+                &mut self,
+                op: G,
+                size: u8,
+                cf_action: G,
+                of_action: G,
+                left: Var,
+                right: Var,
+            ) -> Var {
+                let out = self.action(op, [left, right]);
+                let dest = self.param(&regs::RAX);
+                self.eq(dest, out);
+
+                self.action_into(&regs::CF, cf_action, [out]);
+                self.action_into(&regs::OF, of_action, [out]);
+                self.action_into(&regs::ZF, G::Undefined(size), [out]);
+                self.action_into(&regs::SF, G::Undefined(size), [out]);
+                self.action_into(&regs::RDX, G::Undefined(size), [out]);
+
+                out
             }
 
             fn arith(&mut self, op: G, overflow_s: G, overflow_u: G, left: Var, right: Var) -> Var {
@@ -1649,6 +1797,27 @@ pub mod x64 {
                     ),
                 ],
             )
+            .signed_multiply_variants(
+                G::SMul,
+                G::MulTrunc,
+                G::MulTrunc,
+                [
+                    (
+                        32,
+                        "imul r32, r32",
+                        "imul r32, m32",
+                        "imul r32, r32, imm32",
+                        "imul r32, m32, imm32",
+                    ),
+                    (
+                        64,
+                        "imul r64, r64",
+                        "imul r64, m64",
+                        "imul r64, r64, imm32",
+                        "imul r64, m64, imm32",
+                    ),
+                ],
+            )
             .move_variants(
                 G::Move,
                 [
@@ -1722,6 +1891,44 @@ pub mod x64 {
                     ),
                 ],
             )
+            .instr("mul r32", |new| {
+                let left = new.param(INT_REG);
+                let right = new.param(INT_REG);
+
+                let _ = new.integer_umul(G::UMul(32), 32, G::IsNonZero, G::IsNonZero, left, right);
+            })
+            .instr("mul m32", |new| {
+                let left = new.param(INT_REG);
+                let right_addr = new.memory();
+                let right = new.action(
+                    G::Load {
+                        out: 32,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [right_addr],
+                );
+
+                let _ = new.integer_umul(G::UMul(32), 32, G::IsNonZero, G::IsNonZero, left, right);
+            })
+            .instr("mul r64", |new| {
+                let left = new.param(INT_REG);
+                let right = new.param(INT_REG);
+
+                let _ = new.integer_umul(G::UMul(64), 64, G::IsNonZero, G::IsNonZero, left, right);
+            })
+            .instr("mul m64", |new| {
+                let left = new.param(INT_REG);
+                let right_addr = new.memory();
+                let right = new.action(
+                    G::Load {
+                        out: 64,
+                        mem_size: MEM_OPERAND_SIZE,
+                    },
+                    [right_addr],
+                );
+
+                let _ = new.integer_umul(G::UMul(64), 64, G::IsNonZero, G::IsNonZero, left, right);
+            })
             .instr("cmp r32, r32", |new| {
                 let left = new.param(INT_REG);
                 let right = new.param(INT_REG);
